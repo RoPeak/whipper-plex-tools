@@ -1,0 +1,903 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+APP="Whipper Plex Wizard"
+CFG_DIR="$HOME/.config/whipper-plex-wizard"
+CFG_FILE="$CFG_DIR/settings.env"
+mkdir -p "$CFG_DIR"
+
+# ---------- defaults ----------
+DEVICE="${DEVICE:-}"
+OUT_ROOT="${OUT_ROOT:-$HOME/Music}"
+MULTIDISC="${MULTIDISC:-no}"          # yes/no
+INCLUDE_TRACK_ARTIST="${INCLUDE_TRACK_ARTIST:-no}" # yes/no
+COVER_MODE="${COVER_MODE:-complete}"  # file|embed|complete
+PROMPT_RELEASE="${PROMPT_RELEASE:-yes}" # yes/no
+ALLOW_UNKNOWN="${ALLOW_UNKNOWN:-no}"    # yes/no
+KEEP_GOING="${KEEP_GOING:-no}"          # yes/no
+MAX_RETRIES="${MAX_RETRIES:-5}"         # 0 = infinity
+PAD_TRACK_NUMBERS="${PAD_TRACK_NUMBERS:-yes}" # yes/no
+EJECT_AFTER="${EJECT_AFTER:-no}"        # yes/no
+
+# Whipper 0.10.0/cdparanoia can crash while trying some high offsets.
+# Keep automatic search to common offsets with absolute values <= 587.
+SAFE_OFFSET_SEARCH="+6,+48,+102,+30,+12,+103,+96,+98,-472,+97,-24,+572,-491,+91,+145,+86,+355,+79,+564,-496,0,-436,+94,+106,+117,+92,-54,-582,-489,+534,+122,+111,+108,+87,-495,-494,-12,+234,+138"
+
+cfg_is_safe() {
+  local line key value
+
+  [[ -f "$CFG_FILE" ]] || return 0
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" == \#* ]] && continue
+
+    key="${line%%=*}"
+    value="${line#*=}"
+    case "$key" in
+      DEVICE|OUT_ROOT|MULTIDISC|INCLUDE_TRACK_ARTIST|COVER_MODE|PROMPT_RELEASE|ALLOW_UNKNOWN|KEEP_GOING|MAX_RETRIES|PAD_TRACK_NUMBERS|EJECT_AFTER) ;;
+      *) return 1 ;;
+    esac
+
+    # The wizard writes shell-escaped scalar assignments. Reject obvious code.
+    [[ "$value" == *'$'* || "$value" == *'`'* || "$value" == *';'* || "$value" == *'&'* || "$value" == *'|'* || "$value" == *'<'* || "$value" == *'>'* || "$value" == *'('* || "$value" == *')'* ]] && return 1
+  done < "$CFG_FILE"
+
+  return 0
+}
+
+load_cfg() {
+  if [[ -f "$CFG_FILE" ]]; then
+    if cfg_is_safe; then
+      source "$CFG_FILE"
+    else
+      echo "⚠ Warning:  Ignoring unsafe or unrecognized settings file: $CFG_FILE"
+    fi
+  fi
+}
+
+is_yes() {
+  case "${1,,}" in
+    y|yes) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_no() {
+  case "${1,,}" in
+    n|no) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_nonneg_int() {
+  [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+coerce_yes_no() {
+  local answer="$1"
+  local default="$2"
+
+  if [[ -z "${answer:-}" ]]; then
+    echo "$default"
+  elif is_yes "$answer"; then
+    echo yes
+  elif is_no "$answer"; then
+    echo no
+  else
+    return 1
+  fi
+}
+
+run_logged() {
+  local log_file="$1"
+  shift
+
+  set +e
+  "$@" 2>&1 | tee "$log_file"
+  local status=${PIPESTATUS[0]}
+  set -e
+  return "$status"
+}
+
+looks_like_cover_art_network_failure() {
+  local log_file="$1"
+
+  grep -Eq 'getCoverArt|Cover Art Archive|musicbrainzngs\.musicbrainz\.NetworkError|HTTP Error 30[0-9]' "$log_file"
+}
+
+diagnose_rip_failure() {
+  local log_file="$1"
+
+  if looks_like_cover_art_network_failure "$log_file"; then
+    echo "   Cause: Whipper failed while fetching cover art."
+    echo "   Try the cover-art-free retry when offered."
+  elif grep -Eq "giving up on track|couldn't read any frames|file size 0 did not match expected size" "$log_file"; then
+    echo "   Cause: cdparanoia could not get a usable read for at least one track."
+    echo "   Try cleaning the disc, reinserting it, and ripping again."
+    echo "   If this happens repeatedly on the same track, try another drive or inspect the disc for damage."
+  elif grep -Eq "requested release id .* none of the found releases match" "$log_file"; then
+    echo "   Cause: the selected MusicBrainz release did not match this disc."
+    echo "   Try again and choose a different numbered release."
+  elif grep -Eq "output directory .* is a finished rip" "$log_file"; then
+    echo "   Cause: Whipper thinks this album was already ripped in the staging area."
+    echo "   This should be rare; try the rip again."
+  else
+    echo "   Check the Whipper output above for the exact failure."
+  fi
+}
+
+choose_release_id() {
+  local selected_file
+  selected_file="$(mktemp -t whipper-release-XXXXXX)"
+
+  set +e
+  python3 - "$DEVICE" "$selected_file" <<'PY'
+import sys
+from whipper.common import common, config, mbngs, program, task
+from whipper.common import drive
+from whipper.program import utils
+
+device = sys.argv[1]
+selected_file = sys.argv[2]
+
+try:
+    cfg = config.Config()
+    prog = program.Program(cfg)
+    runner = task.SyncRunner()
+
+    utils.load_device(device)
+    utils.unmount_device(device)
+    if drive.get_cdrom_drive_status(device) == 1:
+        print("No CD detected; insert one and retry.", file=sys.stderr)
+        raise SystemExit(1)
+
+    toc = prog.getFastToc(runner, device)
+    discid = toc.getMusicBrainzDiscId()
+    disc_duration = toc.duration()
+    releases = mbngs.musicbrainz(discid)
+except Exception as exc:
+    print("Could not build numbered MusicBrainz release list: %s" % exc, file=sys.stderr)
+    raise SystemExit(1)
+
+if not releases:
+    raise SystemExit(1)
+
+deltas = [abs(md.duration - disc_duration) for md in releases]
+default_index = deltas.index(min(deltas))
+
+print()
+print("Matching MusicBrainz releases:")
+for idx, md in enumerate(releases, 1):
+    marker = " [default]" if idx - 1 == default_index else ""
+    print()
+    print("%d)%s %s - %s" % (idx, marker, md.artist, md.releaseTitle))
+    print("   Duration: %s" % common.formatTime(md.duration / 1000.0))
+    print("   Type    : %s" % md.releaseType)
+    if md.countries:
+        print("   Country : %s" % ", ".join(md.countries))
+    if md.barcode:
+        print("   Barcode : %s" % md.barcode)
+    if md.catalogNumber:
+        print("   Cat no  : %s" % md.catalogNumber)
+    if md.discNumber and md.discTotal and int(md.discTotal) > 1:
+        print("   Disc    : %s of %s" % (md.discNumber, md.discTotal))
+    print("   Release : %s" % md.mbid)
+
+while True:
+    choice = input("\nChoose release number [%d], paste a release ID, or q to fall back to Whipper prompt: " % (default_index + 1)).strip()
+    if not choice:
+        selected = releases[default_index].mbid
+        break
+    if choice.lower() in {"q", "quit", "fallback"}:
+        raise SystemExit(2)
+    if choice.isdigit():
+        number = int(choice)
+        if 1 <= number <= len(releases):
+            selected = releases[number - 1].mbid
+            break
+    for md in releases:
+        if choice == md.mbid:
+            selected = md.mbid
+            break
+    else:
+        print("Please enter a number from 1-%d, a listed release ID, or q." % len(releases))
+        continue
+    break
+
+with open(selected_file, "w", encoding="utf-8") as handle:
+    handle.write(selected + "\n")
+
+print("Selected release: %s" % selected)
+PY
+  local status=$?
+  set -e
+
+  if [[ $status -eq 0 && -s "$selected_file" ]]; then
+    RELEASE_ID="$(<"$selected_file")"
+    rm -f -- "$selected_file"
+    return 0
+  fi
+
+  rm -f -- "$selected_file"
+  return "$status"
+}
+
+save_cfg() {
+  {
+    echo "# $APP settings"
+    printf 'DEVICE=%q\n' "$DEVICE"
+    printf 'OUT_ROOT=%q\n' "$OUT_ROOT"
+    printf 'MULTIDISC=%q\n' "$MULTIDISC"
+    printf 'INCLUDE_TRACK_ARTIST=%q\n' "$INCLUDE_TRACK_ARTIST"
+    printf 'COVER_MODE=%q\n' "$COVER_MODE"
+    printf 'PROMPT_RELEASE=%q\n' "$PROMPT_RELEASE"
+    printf 'ALLOW_UNKNOWN=%q\n' "$ALLOW_UNKNOWN"
+    printf 'KEEP_GOING=%q\n' "$KEEP_GOING"
+    printf 'MAX_RETRIES=%q\n' "$MAX_RETRIES"
+    printf 'PAD_TRACK_NUMBERS=%q\n' "$PAD_TRACK_NUMBERS"
+    printf 'EJECT_AFTER=%q\n' "$EJECT_AFTER"
+  } > "$CFG_FILE"
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+ensure_deps() {
+  local missing=()
+  for c in whipper flac; do
+    need_cmd "$c" || missing+=("$c")
+  done
+  need_cmd metaflac || missing+=("flac")
+
+  # Pillow for cover art embed/complete (Debian/Ubuntu package: python3-pil)
+  if [[ "$COVER_MODE" == "embed" || "$COVER_MODE" == "complete" ]]; then
+    dpkg -s python3-pil >/dev/null 2>&1 || missing+=("python3-pil")
+  fi
+
+  if ((${#missing[@]}==0)); then
+    echo "✔ Success: Dependencies look OK."
+    return 0
+  fi
+
+  echo "Missing packages: ${missing[*]}"
+  read -rp "Install them now with apt (requires sudo)? [y/N] " yn
+  if is_yes "$yn"; then
+    if sudo apt update && sudo apt install -y whipper flac python3-pil; then
+      echo "✔ Success: Installed."
+    else
+      echo "✘ Fail: Package install failed. Check the apt output above."
+      return 1
+    fi
+  else
+    echo "Skipping install. You can install later with:"
+    echo "  sudo apt update && sudo apt install -y whipper flac python3-pil"
+  fi
+}
+
+pick_device() {
+  echo
+  echo "Available CD devices (common):"
+  local devs=()
+  # Prefer /dev/cdrom if present
+  [[ -e /dev/cdrom ]] && devs+=("/dev/cdrom")
+  # Add sr* devices
+  for d in /dev/sr*; do
+    [[ -e "$d" ]] && devs+=("$d")
+  done
+
+  if ((${#devs[@]}==0)); then
+    echo "✘ Fail: I can't see /dev/cdrom or /dev/sr* on this system."
+    echo "   If your drive is plugged in, check: lsblk, dmesg | tail"
+    return 1
+  fi
+
+  echo "Select a device:"
+  select choice in "${devs[@]}" "Enter manually"; do
+    case "$REPLY" in
+      ''|*[!0-9]*)
+        echo "Please enter a number from the list."
+        ;;
+      *)
+        if [[ -z "${choice:-}" ]]; then
+          echo "Please enter a number from the list."
+          continue
+        fi
+        if [[ "$choice" == "Enter manually" ]]; then
+          read -rp "Enter device path (e.g. /dev/sr0): " manual
+          DEVICE="$manual"
+        else
+          DEVICE="$choice"
+        fi
+        break
+        ;;
+    esac
+  done
+
+  if [[ ! -e "$DEVICE" ]]; then
+    echo "✘ Fail: Device does not exist - $DEVICE"
+    return 1
+  fi
+
+  if [[ ! -r "$DEVICE" ]]; then
+    echo "⚠ Warning:  No read permission for $DEVICE."
+    echo "   Try: sudo usermod -aG cdrom \"$USER\"  (then log out/in)"
+    echo "   Avoid running the wizard with sudo unless you intentionally want root-owned config/output."
+  fi
+
+  echo "✔ Success: Using device - $DEVICE"
+  save_cfg
+}
+
+edit_prefs() {
+  local v new
+
+  echo
+  echo "Current settings:"
+  echo "  Output root:           $OUT_ROOT"
+  echo "  Multi-disc folders:    $MULTIDISC"
+  echo "  Track artist in name:  $INCLUDE_TRACK_ARTIST"
+  echo "  Cover art mode:        $COVER_MODE (file|embed|complete)"
+  echo "  Prompt release pick:   $PROMPT_RELEASE"
+  echo "  Allow unknown discs:   $ALLOW_UNKNOWN"
+  echo "  Keep going on errors:  $KEEP_GOING"
+  echo "  Max retries/track:     $MAX_RETRIES"
+  echo "  Pad track numbers:     $PAD_TRACK_NUMBERS"
+  echo "  Eject after rip:       $EJECT_AFTER"
+  echo
+
+  read -rp "Output root directory for music (ENTER to keep): " v
+  [[ -n "${v:-}" ]] && OUT_ROOT="$v"
+
+  read -rp "Put multi-disc albums in CD1/CD2 folders? [y/N] " v
+  if [[ -n "${v:-}" ]]; then
+    if new="$(coerce_yes_no "$v" no)"; then
+      MULTIDISC="$new"
+    else
+      echo "Keeping $MULTIDISC (please enter yes or no)."
+    fi
+  fi
+
+  read -rp "Include track artist in filename (useful for compilations)? [y/N] " v
+  if [[ -n "${v:-}" ]]; then
+    if new="$(coerce_yes_no "$v" no)"; then
+      INCLUDE_TRACK_ARTIST="$new"
+    else
+      echo "Keeping $INCLUDE_TRACK_ARTIST (please enter yes or no)."
+    fi
+  fi
+
+  read -rp "Cover art mode: file/embed/complete (ENTER to keep: $COVER_MODE): " v
+  if [[ -n "${v:-}" ]]; then
+    case "${v,,}" in
+      file|embed|complete) COVER_MODE="${v,,}" ;;
+      *) echo "Keeping $COVER_MODE (invalid input)." ;;
+    esac
+  fi
+
+  read -rp "Prompt if multiple MusicBrainz releases match? [Y/n] " v
+  if [[ -n "${v:-}" ]]; then
+    if new="$(coerce_yes_no "$v" yes)"; then
+      PROMPT_RELEASE="$new"
+    else
+      echo "Keeping $PROMPT_RELEASE (please enter yes or no)."
+    fi
+  fi
+
+  read -rp "Allow ripping even if MusicBrainz can't identify the disc? [y/N] " v
+  if [[ -n "${v:-}" ]]; then
+    if new="$(coerce_yes_no "$v" no)"; then
+      ALLOW_UNKNOWN="$new"
+    else
+      echo "Keeping $ALLOW_UNKNOWN (please enter yes or no)."
+    fi
+  fi
+
+  read -rp "Keep going if a track fails (creates partial rips)? [y/N] " v
+  if [[ -n "${v:-}" ]]; then
+    if new="$(coerce_yes_no "$v" no)"; then
+      KEEP_GOING="$new"
+    else
+      echo "Keeping $KEEP_GOING (please enter yes or no)."
+    fi
+  fi
+
+  read -rp "Max retries per track (0=infinite, ENTER to keep: $MAX_RETRIES): " v
+  if [[ -n "${v:-}" ]]; then
+    if is_nonneg_int "$v"; then
+      MAX_RETRIES="$v"
+    else
+      echo "Keeping $MAX_RETRIES (max retries must be a non-negative integer)."
+    fi
+  fi
+
+  read -rp "Pad track numbers to 01/02/... after ripping? [Y/n] " v
+  if [[ -n "${v:-}" ]]; then
+    if new="$(coerce_yes_no "$v" yes)"; then
+      PAD_TRACK_NUMBERS="$new"
+    else
+      echo "Keeping $PAD_TRACK_NUMBERS (please enter yes or no)."
+    fi
+  fi
+
+  read -rp "Eject tray after successful rip? [y/N] " v
+  if [[ -n "${v:-}" ]]; then
+    if new="$(coerce_yes_no "$v" no)"; then
+      EJECT_AFTER="$new"
+    else
+      echo "Keeping $EJECT_AFTER (please enter yes or no)."
+    fi
+  fi
+
+  mkdir -p "$OUT_ROOT"
+  save_cfg
+  echo "✔ Saved."
+}
+
+drive_setup() {
+  ensure_deps || return 1
+  if [[ -z "$DEVICE" ]]; then
+    pick_device || return 1
+  fi
+
+  echo
+  echo "=== Drive setup (EAC-like) ==="
+  echo "1) Analyze drive cache behaviour"
+  echo "2) Find drive offset safely (AccurateRip, avoids known high-offset crash)"
+  echo "3) Find drive offset with a known/manual offset"
+  echo "4) Back"
+  echo
+  read -rp "Choose [1-4]: " ch
+
+  case "$ch" in
+    1)
+      echo
+      echo "Insert a relatively common CD, then press ENTER."
+      read -r
+      if whipper drive analyze -d "$DEVICE"; then
+        echo "✔ Done."
+      else
+        echo "✘ Fail: Drive analysis failed."
+        echo "   Check the disc is inserted, the device is correct, and your user can read $DEVICE."
+        return 1
+      fi
+      ;;
+    2)
+      echo
+      echo "This uses a restricted offset list to avoid a known Whipper/cdparanoia crash with high offsets."
+      echo "Tip: you can inspect your drive and any saved offset with:"
+      echo "  whipper drive list"
+      echo
+      whipper drive list
+      echo
+      echo "Insert a common CD (likely in AccurateRip), then press ENTER."
+      read -r
+      if whipper offset find -d "$DEVICE" -o "$SAFE_OFFSET_SEARCH"; then
+        echo "✔ Done (confirmed offsets are saved into whipper.conf automatically)."
+      else
+        echo "✘ Fail: Offset detection failed."
+        echo "   Try a different common CD, clean the disc, or use option 3 if you know the offset."
+        return 1
+      fi
+      ;;
+    3)
+      echo
+      echo "Use this if you found the drive offset from AccurateRip/online."
+      echo "Whipper will verify the supplied offset against the inserted disc."
+      read -rp "Enter one offset or comma-separated offsets (e.g. 6 or -102,+6): " off
+      if [[ -z "${off:-}" ]]; then
+        echo "No offset entered."
+        return 1
+      fi
+      if [[ ! "$off" =~ ^[+-]?[0-9]+([,][+-]?[0-9]+)*$ ]]; then
+        echo "✘ Fail: Invalid offset list. Use integers separated by commas, e.g. 6 or -102,+6."
+        return 1
+      fi
+      echo "Insert a common CD (likely in AccurateRip), then press ENTER."
+      read -r
+      if whipper offset find -d "$DEVICE" -o "$off"; then
+        echo "✔ Done (confirmed offsets are saved into whipper.conf automatically)."
+      else
+        echo "✘ Fail: Offset verification failed for $off"
+        return 1
+      fi
+      ;;
+    *)
+      ;;
+  esac
+}
+
+track_template() {
+  # Plex-ish: Artist/Album (Year)/01 - Title.flac
+  # If compilation, MusicBrainz album artist is usually "Various Artists" so folder stays sane.
+  local base
+  if [[ "$INCLUDE_TRACK_ARTIST" == "yes" ]]; then
+    base="%t - %a - %n"
+  else
+    base="%t - %n"
+  fi
+
+  if [[ "$MULTIDISC" == "yes" ]]; then
+    echo "%A/%d (%y)/CD%N/$base"
+  else
+    echo "%A/%d (%y)/$base"
+  fi
+}
+
+disc_template() {
+  # Hide disc-level artefacts in album/.whipper/
+  if [[ "$MULTIDISC" == "yes" ]]; then
+    echo "%A/%d (%y)/.whipper/CD%N/%A - %d"
+  else
+    echo "%A/%d (%y)/.whipper/%A - %d"
+  fi
+}
+
+pad_tracks_in_dirs() {
+  local dirs=("$@")
+  for dir in "${dirs[@]}"; do
+    [[ -d "$dir" ]] || continue
+    shopt -s nullglob
+    local files=("$dir"/*.flac)
+    shopt -u nullglob
+    ((${#files[@]}==0)) && continue
+
+    for f in "${files[@]}"; do
+      local base new num rest
+      base="$(basename "$f")"
+
+      # Match "1 - Title.flac" or "1- Title.flac" (with flexible spaces)
+      if [[ "$base" =~ ^([0-9]{1,2})[[:space:]]*-[[:space:]]*(.*)$ ]]; then
+        num="${BASH_REMATCH[1]}"
+        rest="${BASH_REMATCH[2]}"
+
+        # Already padded?
+        if [[ ${#num} -eq 2 ]]; then
+          continue
+        fi
+
+        new="$(printf "%02d" "$num") - $rest"
+        if [[ "$new" != "$base" ]]; then
+          if [[ -e "$dir/$new" ]]; then
+            echo "⚠ Warning:  Won't rename (target exists) - $dir/$new"
+          else
+            mv -- "$f" "$dir/$new"
+          fi
+        fi
+      fi
+    done
+  done
+}
+
+album_dir_for_track_dir() {
+  local dir="$1"
+  local name
+
+  name="$(basename "$dir")"
+  if [[ "$name" =~ ^CD[0-9]+$ ]]; then
+    dirname "$dir"
+  else
+    printf '%s\n' "$dir"
+  fi
+}
+
+find_album_cover() {
+  local album_dir="$1"
+
+  [[ -d "$album_dir/.whipper" ]] || return 1
+  find "$album_dir/.whipper" -maxdepth 2 -type f \
+    \( -iname 'cover.jpg' -o -iname 'cover.jpeg' -o -iname 'folder.jpg' -o -iname 'cover.png' -o -iname 'folder.png' \) \
+    -print -quit
+}
+
+flac_has_picture() {
+  [[ -n "$(metaflac --list --block-type=PICTURE "$1")" ]]
+}
+
+copy_album_cover_for_plex() {
+  local album_dir="$1"
+  local cover="$2"
+  local target
+
+  if [[ -e "$album_dir/cover.jpg" || -e "$album_dir/cover.jpeg" || -e "$album_dir/cover.png" || -e "$album_dir/folder.jpg" || -e "$album_dir/folder.png" ]]; then
+    return 0
+  fi
+
+  case "${cover,,}" in
+    *.png) target="$album_dir/cover.png" ;;
+    *) target="$album_dir/cover.jpg" ;;
+  esac
+
+  if cp -- "$cover" "$target"; then
+    echo "Saved Plex cover: $target"
+  else
+    echo "⚠ Warning:  Could not save Plex cover - $target"
+  fi
+}
+
+postprocess_cover_art() {
+  local dirs=("$@")
+  local dir album_dir cover f embedded_count
+
+  ((${#dirs[@]} > 0)) || return 0
+
+  if ! need_cmd metaflac; then
+    echo "⚠ Warning:  metaflac is not installed; cannot verify/embed FLAC cover art."
+    return 0
+  fi
+
+  for dir in "${dirs[@]}"; do
+    [[ -d "$dir" ]] || continue
+    album_dir="$(album_dir_for_track_dir "$dir")"
+    cover="$(find_album_cover "$album_dir" || true)"
+    [[ -n "$cover" ]] || continue
+
+    copy_album_cover_for_plex "$album_dir" "$cover"
+
+    embedded_count=0
+    shopt -s nullglob
+    for f in "$dir"/*.flac; do
+      if flac_has_picture "$f"; then
+        continue
+      fi
+      if metaflac --preserve-modtime --import-picture-from="$cover" "$f"; then
+        ((embedded_count += 1))
+      else
+        echo "⚠ Warning:  Could not embed cover art in $f"
+      fi
+    done
+    shopt -u nullglob
+
+    if ((embedded_count > 0)); then
+      echo "Embedded cover art in $embedded_count FLAC file(s) under: $dir"
+    fi
+  done
+}
+
+publish_staged_output() {
+  local stage="$1"
+  local dest="$2"
+  local src rel target
+  local conflicts=()
+  local files=()
+
+  mapfile -t files < <(find "$stage" -type f | sort)
+  if ((${#files[@]} == 0)); then
+    echo "✘ Fail: Whipper finished, but no files were created in the staging directory."
+    echo "   Staging directory kept for inspection: $stage"
+    return 1
+  fi
+
+  for src in "${files[@]}"; do
+    rel="${src#"$stage"/}"
+    target="$dest/$rel"
+    if [[ -e "$target" ]]; then
+      conflicts+=("$rel")
+    fi
+  done
+
+  if ((${#conflicts[@]} > 0)); then
+    echo
+    echo "✘ Fail: Not copying this rip into your library because these files already exist:"
+    printf '  %s\n' "${conflicts[@]}"
+    echo
+    echo "Staged rip kept here:"
+    echo "  $stage"
+    echo "Move or rename files manually after checking them, then delete the staging folder when done."
+    return 1
+  fi
+
+  for src in "${files[@]}"; do
+    rel="${src#"$stage"/}"
+    target="$dest/$rel"
+    mkdir -p "$(dirname "$target")"
+    cp -p -- "$src" "$target"
+  done
+
+  echo "Published rip into library: $dest"
+  return 0
+}
+
+rip_cd() {
+  ensure_deps || return 1
+  if [[ -z "$DEVICE" ]]; then
+    pick_device || return 1
+  fi
+  mkdir -p "$OUT_ROOT"
+
+  echo
+  echo "Insert the CD you want to rip, then press ENTER."
+  read -r
+
+  local TT DT
+  TT="$(track_template)"
+  DT="$(disc_template)"
+
+  echo
+  echo "Ripping with:"
+  echo "  Device:      $DEVICE"
+  echo "  Output root: $OUT_ROOT"
+  echo "  Track tpl:   $TT"
+  echo "  Disc tpl:    $DT"
+  echo "  Cover art:   $COVER_MODE"
+  echo "  Retries:     $MAX_RETRIES"
+  echo
+  local RELEASE_ID=""
+
+  local mark work stage_out run_log rc
+  local dirs=()
+  mark="$(mktemp)"
+  touch "$mark"
+  work="$(mktemp -d -t whipper-work-XXXXXX)"
+  stage_out="$(mktemp -d -t whipper-out-XXXXXX)"
+  run_log="$(mktemp -t whipper-run-XXXXXX.log)"
+  cleanup_rip_tmp() {
+    [[ -n "${mark:-}" ]] && rm -f -- "$mark"
+    [[ -n "${run_log:-}" ]] && rm -f -- "$run_log"
+    if [[ -n "${work:-}" && "$work" == /tmp/whipper-work-* ]]; then
+      rm -rf -- "$work"
+    fi
+    if [[ -n "${stage_out:-}" && "$stage_out" == /tmp/whipper-out-* ]]; then
+      rm -rf -- "$stage_out"
+    fi
+  }
+  trap 'cleanup_rip_tmp; trap - RETURN' RETURN
+
+  build_rip_args() {
+    local cover_mode="$1"
+    args=(
+        cd -d "$DEVICE" rip
+        --output-directory "$stage_out"
+        --working-directory "$work"
+        --track-template "$TT"
+        --disc-template "$DT"
+        --max-retries "$MAX_RETRIES"
+    )
+
+    [[ "$cover_mode" != "none" ]] && args+=(--cover-art "$cover_mode")
+    if [[ -n "$RELEASE_ID" ]]; then
+      args+=(--release-id "$RELEASE_ID")
+    elif [[ "$PROMPT_RELEASE" == "yes" ]]; then
+      args+=(--prompt)
+    fi
+    [[ "$ALLOW_UNKNOWN" == "yes" ]] && args+=(--unknown)
+    [[ "$KEEP_GOING" == "yes" ]] && args+=(--keep-going)
+    return 0
+  }
+
+  local args=()
+  if [[ "$PROMPT_RELEASE" == "yes" ]]; then
+    echo "Release tip: avoid bootlegs/box sets unless that is the disc you actually have."
+    echo "Choose by number below; the long MusicBrainz ID is shown only for reference."
+    if choose_release_id; then
+      echo
+    else
+      echo
+      echo "Falling back to Whipper's built-in release prompt."
+      echo
+    fi
+  fi
+  build_rip_args "$COVER_MODE"
+
+  # Run
+  if run_logged "$run_log" whipper "${args[@]}"; then
+    :
+  else
+    rc=$?
+    if looks_like_cover_art_network_failure "$run_log"; then
+      echo
+      echo "⚠ Warning:  Whipper failed while fetching cover art, before completing the rip."
+      read -rp "Retry this rip without Whipper cover-art fetching? [Y/n] " retry_coverless
+      if ! is_no "${retry_coverless:-}"; then
+        if [[ "$stage_out" == /tmp/whipper-out-* ]]; then
+          rm -rf -- "$stage_out"
+        fi
+        if [[ "$work" == /tmp/whipper-work-* ]]; then
+          rm -rf -- "$work"
+        fi
+        work="$(mktemp -d -t whipper-work-XXXXXX)"
+        stage_out="$(mktemp -d -t whipper-out-XXXXXX)"
+        : > "$run_log"
+        echo
+        echo "Retrying without --cover-art. Audio metadata and AccurateRip verification still apply."
+        echo
+        build_rip_args none
+        if run_logged "$run_log" whipper "${args[@]}"; then
+          :
+        else
+          rc=$?
+          echo
+          echo "✘ Fail: Rip failed on retry."
+          diagnose_rip_failure "$run_log"
+          echo "   No cleanup touched your music directory."
+          return "$rc"
+        fi
+      else
+        echo
+        echo "✘ Fail: Rip failed."
+        diagnose_rip_failure "$run_log"
+        echo "   No cleanup touched your music directory."
+        return "$rc"
+      fi
+    else
+      echo
+      echo "✘ Fail: Rip failed."
+      diagnose_rip_failure "$run_log"
+      echo "   No cleanup touched your music directory."
+      return "$rc"
+    fi
+  fi
+
+  mapfile -t dirs < <(find "$stage_out" -type f -name '*.flac' -newer "$mark" -printf '%h\n' | sort -u)
+
+  # Post-process: pad track numbers (optional)
+  if [[ "$PAD_TRACK_NUMBERS" == "yes" ]]; then
+    if ((${#dirs[@]}>0)); then
+      pad_tracks_in_dirs "${dirs[@]}"
+    fi
+  fi
+
+  if [[ "$COVER_MODE" == "embed" || "$COVER_MODE" == "complete" ]]; then
+    postprocess_cover_art "${dirs[@]}"
+  fi
+
+  if publish_staged_output "$stage_out" "$OUT_ROOT"; then
+    rm -rf -- "$stage_out"
+    stage_out=""
+  else
+    stage_out=""
+    return 1
+  fi
+
+  # Optional eject
+  if [[ "$EJECT_AFTER" == "yes" ]]; then
+    if eject "$DEVICE" >/dev/null 2>&1; then
+      echo "Ejected: $DEVICE"
+    else
+      echo "⚠ Warning:  Rip succeeded, but eject failed for $DEVICE."
+    fi
+  fi
+
+  echo
+  echo "✔ Done."
+  echo "Tip: disc artefacts (.log/.cue/.m3u) are stored under each album's: .whipper/"
+}
+
+main_menu() {
+  local choice rc
+
+  echo
+  echo "=== $APP ==="
+  echo "Device: ${DEVICE:-<not set>}"
+  echo "Output: $OUT_ROOT"
+  echo
+  echo "1) Install/verify dependencies"
+  echo "2) Pick / change CD drive"
+  echo "3) Drive setup (analyze + offset)"
+  echo "4) Edit ripping preferences"
+  echo "5) Rip a CD now"
+  echo "6) Quit"
+  echo
+  read -rp "Choose [1-6]: " choice
+  choice="${choice//[[:space:]]/}"
+  case "$choice" in
+    1) ensure_deps || rc=$? ;;
+    2) pick_device || rc=$? ;;
+    3) drive_setup || rc=$? ;;
+    4) edit_prefs || rc=$? ;;
+    5) rip_cd || rc=$? ;;
+    6) exit 0 ;;
+    *) echo "Invalid choice." ;;
+  esac
+
+  if [[ -n "${rc:-}" && "$rc" -ne 0 ]]; then
+    echo
+    echo "Returning to menu."
+  fi
+}
+
+load_cfg
+while true; do
+  main_menu
+done

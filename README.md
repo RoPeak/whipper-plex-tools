@@ -1,0 +1,109 @@
+# whipper-plex-tools
+
+Small Linux tools for ripping CDs with Whipper and keeping a Plex music library tidy.
+
+The main tool is `whipper-plex-wizard`, an interactive Bash wrapper around Whipper for ripping CDs to FLAC with MusicBrainz metadata, cover art, AccurateRip verification, and a Plex-friendly directory layout.
+
+## Current Tools
+
+### `bin/whipper-plex-wizard`
+
+Interactive CD ripping wizard for Ubuntu.
+
+It helps with:
+
+- dependency checks for Whipper and FLAC tools
+- CD drive selection
+- drive cache analysis
+- safe AccurateRip offset detection for Whipper 0.10.0
+- numbered MusicBrainz release selection
+- FLAC ripping with MusicBrainz metadata
+- embedded and saved cover art
+- Plex-style output:
+
+```text
+Music/Artist/Album (Year)/01 - Track Title.flac
+```
+
+Optional multi-disc layout:
+
+```text
+Music/Artist/Album (Year)/CD1/01 - Track Title.flac
+```
+
+Verification artifacts are kept under each album's hidden `.whipper/` folder.
+
+## Requirements
+
+Tested on Ubuntu with:
+
+- `whipper 0.10.0`
+- `flac`
+- `metaflac`
+- `python3-pil`
+
+Install dependencies:
+
+```bash
+sudo apt update
+sudo apt install -y whipper flac python3-pil
+```
+
+## Usage
+
+Run the wizard:
+
+```bash
+./bin/whipper-plex-wizard
+```
+
+First-time setup for a drive:
+
+1. Pick the CD drive.
+2. Run drive cache analysis.
+3. Run safe offset detection.
+4. Rip CDs.
+
+You do not need to repeat drive setup every time. Whipper saves the drive offset and cache behavior in its own config.
+
+## Safety Notes
+
+The wizard stages each rip in `/tmp` first. After Whipper finishes, it copies the staged files into your music library only if doing so will not overwrite existing files.
+
+It does not delete user music files. Temporary Whipper work directories are removed after successful or failed runs.
+
+Avoid running the wizard with `sudo`; that can create root-owned config and music files. If your user cannot read the CD device, add yourself to the `cdrom` group and log out/in:
+
+```bash
+sudo usermod -aG cdrom "$USER"
+```
+
+## Troubleshooting
+
+### Whipper offers the wrong MusicBrainz release
+
+If MusicBrainz lists several releases, do not blindly accept the default. Prefer the release that matches your actual CD country, barcode, catalog number, and edition. Bootlegs and large box sets can appear in the match list.
+
+The wizard shows numbered choices and then passes the selected MusicBrainz release ID to Whipper. You should not need to type the long UUID manually.
+
+### Cover art fetch crashes before ripping
+
+Some MusicBrainz/Cover Art Archive entries can trigger Whipper 0.10.0 network errors, including redirect loops. If that happens, the wizard offers to retry without Whipper cover-art fetching. The audio rip can still be AccurateRip-verified; artwork can be repaired later.
+
+### `eject -t` warning
+
+Some external drives do not support Whipper's tray-close command. This warning is usually harmless if ripping continues.
+
+### `cdparanoia couldn't read any frames`
+
+If Whipper retries a track several times and then gives up, the wizard will return to the menu without copying anything into your music library. Try cleaning the disc and ripping again. If the same track fails repeatedly, inspect the disc or try another drive.
+
+## Roadmap
+
+Good next tools for this repo:
+
+- `whipper-drive-report`: summarize Whipper version, drive offset, cache behavior, and permissions
+- `plex-cover-repair`: copy hidden Whipper cover art to album-level `cover.jpg` and embed missing FLAC pictures
+- `plex-flac-verify`: run `flac -t` across a library
+- `whipper-rip-log-summary`: summarize AccurateRip results from `.whipper/*.log`
+- `plex-music-audit`: report missing artwork, missing MusicBrainz tags, duplicate track numbers, and suspicious album folders
