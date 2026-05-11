@@ -17,6 +17,7 @@ It helps with:
 - drive cache analysis
 - safe AccurateRip offset detection for Whipper 0.10.0
 - numbered MusicBrainz release selection
+- keep-going ripping so one failed track does not discard the rest of the album
 - FLAC ripping with MusicBrainz metadata
 - embedded and saved cover art
 - Plex-style output:
@@ -70,6 +71,8 @@ You do not need to repeat drive setup every time. Whipper saves the drive offset
 
 The wizard stages each rip in `/tmp` first. After Whipper finishes, it copies the staged files into your music library only if doing so will not overwrite existing files.
 
+If one or more tracks fail but other tracks were ripped, the wizard publishes a clearly labelled partial album, prints a completed/failed summary, and writes `.whipper/PARTIAL_RIP.txt`. This preserves useful work while making it obvious that the album still needs attention.
+
 It does not delete user music files. Temporary Whipper work directories are removed after successful or failed runs.
 
 Avoid running the wizard with `sudo`; that can create root-owned config and music files. If your user cannot read the CD device, add yourself to the `cdrom` group and log out/in:
@@ -82,9 +85,9 @@ sudo usermod -aG cdrom "$USER"
 
 ### Whipper offers the wrong MusicBrainz release
 
-If MusicBrainz lists several releases, do not blindly accept the default. Prefer the release that matches your actual CD country, barcode, catalog number, and edition. Bootlegs and large box sets can appear in the match list.
+If MusicBrainz lists several releases, do not blindly accept the suggested release. Prefer the release that matches your actual CD country, barcode, catalog number, and edition. Bootlegs and large box sets can appear in the match list.
 
-The wizard shows numbered choices and then passes the selected MusicBrainz release ID to Whipper. You should not need to type the long UUID manually.
+The wizard shows numbered choices and then passes the selected MusicBrainz release ID to Whipper. You should not need to type the long UUID manually. If MusicBrainz returns exactly one release, the wizard selects it automatically and shows the chosen release before ripping.
 
 ### Cover art fetch crashes before ripping
 
@@ -96,7 +99,7 @@ Some external drives do not support Whipper's tray-close command. This warning i
 
 ### `cdparanoia couldn't read any frames`
 
-If Whipper retries a track several times and then gives up, the wizard will return to the menu without copying anything into your music library. Try cleaning the disc and ripping again. If the same track fails repeatedly, inspect the disc or try another drive.
+If Whipper retries a track several times and then gives up, the wizard keeps going where possible. If any FLACs were successfully created, it publishes a clearly labelled partial album and prints a summary of completed and failed tracks. Try cleaning the disc and ripping again. If the same track fails repeatedly, inspect the disc or try another drive.
 
 ## Roadmap
 

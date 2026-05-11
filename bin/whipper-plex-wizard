@@ -15,10 +15,11 @@ INCLUDE_TRACK_ARTIST="${INCLUDE_TRACK_ARTIST:-no}" # yes/no
 COVER_MODE="${COVER_MODE:-complete}"  # file|embed|complete
 PROMPT_RELEASE="${PROMPT_RELEASE:-yes}" # yes/no
 ALLOW_UNKNOWN="${ALLOW_UNKNOWN:-no}"    # yes/no
-KEEP_GOING="${KEEP_GOING:-no}"          # yes/no
+KEEP_GOING="${KEEP_GOING:-yes}"         # yes/no
 MAX_RETRIES="${MAX_RETRIES:-5}"         # 0 = infinity
 PAD_TRACK_NUMBERS="${PAD_TRACK_NUMBERS:-yes}" # yes/no
 EJECT_AFTER="${EJECT_AFTER:-no}"        # yes/no
+EJECT_TIMEOUT_SECONDS=15
 
 # Whipper 0.10.0/cdparanoia can crash while trying some high offsets.
 # Keep automatic search to common offsets with absolute values <= 587.
@@ -106,6 +107,12 @@ looks_like_cover_art_network_failure() {
   grep -Eq 'getCoverArt|Cover Art Archive|musicbrainzngs\.musicbrainz\.NetworkError|HTTP Error 30[0-9]' "$log_file"
 }
 
+rip_log_has_failed_tracks() {
+  local log_file="$1"
+
+  grep -Eq "giving up on track [0-9]+" "$log_file"
+}
+
 diagnose_rip_failure() {
   local log_file="$1"
 
@@ -163,16 +170,53 @@ except Exception as exc:
 if not releases:
     raise SystemExit(1)
 
-deltas = [abs(md.duration - disc_duration) for md in releases]
-default_index = deltas.index(min(deltas))
+def safe_int(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
-print()
-print("Matching MusicBrainz releases:")
-for idx, md in enumerate(releases, 1):
-    marker = " [default]" if idx - 1 == default_index else ""
+def duration_delta(md):
+    if not md.duration:
+        return 10**9
+    return abs(md.duration - disc_duration)
+
+def searchable_text(md):
+    bits = [
+        md.releaseTitle,
+        getattr(md, "title", ""),
+        getattr(md, "mediumTitle", ""),
+        md.catalogNumber,
+    ]
+    return " ".join(str(bit or "") for bit in bits).lower()
+
+def release_score(md):
+    score = duration_delta(md)
+    text = searchable_text(md)
+    release_type = str(md.releaseType or "").lower()
+    disc_total = safe_int(md.discTotal)
+
+    # Duration alone often picks bootlegs or box-set discs. Prefer the ordinary
+    # standalone album when several MusicBrainz matches have the same TOC.
+    if release_type and release_type != "album":
+        score += 180000
+    if disc_total > 1:
+        score += 160000
+    if "bootleg" in text:
+        score += 600000
+    if "disc " in text and " of " in text:
+        score += 160000
+    if "box" in text and "set" in text:
+        score += 100000
+    if not md.barcode:
+        score += 20000
+    return score
+
+def print_release(idx, md, marker=""):
     print()
     print("%d)%s %s - %s" % (idx, marker, md.artist, md.releaseTitle))
-    print("   Duration: %s" % common.formatTime(md.duration / 1000.0))
+    if md.duration:
+        print("   Duration: %s" % common.formatTime(md.duration / 1000.0))
     print("   Type    : %s" % md.releaseType)
     if md.countries:
         print("   Country : %s" % ", ".join(md.countries))
@@ -180,12 +224,40 @@ for idx, md in enumerate(releases, 1):
         print("   Barcode : %s" % md.barcode)
     if md.catalogNumber:
         print("   Cat no  : %s" % md.catalogNumber)
-    if md.discNumber and md.discTotal and int(md.discTotal) > 1:
+    if md.discNumber and md.discTotal and safe_int(md.discTotal) > 1:
         print("   Disc    : %s of %s" % (md.discNumber, md.discTotal))
     print("   Release : %s" % md.mbid)
 
+scores = [release_score(md) for md in releases]
+default_index = scores.index(min(scores))
+
+print()
+if len(releases) == 1:
+    print("Matching MusicBrainz release:")
+    print_release(1, releases[0], " [auto]")
+    selected = releases[0].mbid
+    with open(selected_file, "w", encoding="utf-8") as handle:
+        handle.write(selected + "\n")
+    print()
+    print("Auto-selected the only MusicBrainz match: %s" % selected)
+    raise SystemExit(0)
+
+print("Matching MusicBrainz releases:")
+for idx, md in enumerate(releases, 1):
+    marker = " [suggested]" if idx - 1 == default_index else ""
+    print_release(idx, md, marker)
+
+try:
+    tty = open("/dev/tty", "r", encoding="utf-8")
+except OSError:
+    tty = sys.stdin
+
 while True:
-    choice = input("\nChoose release number [%d], paste a release ID, or q to fall back to Whipper prompt: " % (default_index + 1)).strip()
+    print("\nChoose release number [%d], paste a release ID, or q to fall back to Whipper prompt: " % (default_index + 1), end="", flush=True)
+    choice = tty.readline()
+    if choice == "":
+        raise SystemExit(2)
+    choice = choice.strip()
     if not choice:
         selected = releases[default_index].mbid
         break
@@ -341,7 +413,7 @@ edit_prefs() {
   echo "  Cover art mode:        $COVER_MODE (file|embed|complete)"
   echo "  Prompt release pick:   $PROMPT_RELEASE"
   echo "  Allow unknown discs:   $ALLOW_UNKNOWN"
-  echo "  Keep going on errors:  $KEEP_GOING"
+  echo "  Keep going on errors:  yes (always; preserves partial albums)"
   echo "  Max retries/track:     $MAX_RETRIES"
   echo "  Pad track numbers:     $PAD_TRACK_NUMBERS"
   echo "  Eject after rip:       $EJECT_AFTER"
@@ -391,15 +463,6 @@ edit_prefs() {
       ALLOW_UNKNOWN="$new"
     else
       echo "Keeping $ALLOW_UNKNOWN (please enter yes or no)."
-    fi
-  fi
-
-  read -rp "Keep going if a track fails (creates partial rips)? [y/N] " v
-  if [[ -n "${v:-}" ]]; then
-    if new="$(coerce_yes_no "$v" no)"; then
-      KEEP_GOING="$new"
-    else
-      echo "Keeping $KEEP_GOING (please enter yes or no)."
     fi
   fi
 
@@ -616,6 +679,32 @@ copy_album_cover_for_plex() {
   fi
 }
 
+eject_after_session() {
+  local label="${1:-session}"
+
+  if [[ "$EJECT_AFTER" != "yes" ]]; then
+    return 0
+  fi
+
+  echo "Ejecting $DEVICE..."
+  set +e
+  if need_cmd timeout; then
+    timeout "${EJECT_TIMEOUT_SECONDS}s" eject "$DEVICE" >/dev/null 2>&1
+  else
+    eject "$DEVICE" >/dev/null 2>&1
+  fi
+  local status=$?
+  set -e
+
+  if [[ $status -eq 0 ]]; then
+    echo "Ejected: $DEVICE"
+  elif [[ $status -eq 124 ]]; then
+    echo "⚠ Warning:  $label finished, but eject timed out after ${EJECT_TIMEOUT_SECONDS}s."
+  else
+    echo "⚠ Warning:  $label finished, but eject failed for $DEVICE."
+  fi
+}
+
 postprocess_cover_art() {
   local dirs=("$@")
   local dir album_dir cover f embedded_count
@@ -699,6 +788,149 @@ publish_staged_output() {
   return 0
 }
 
+list_staged_flacs() {
+  local stage="$1"
+  find "$stage" -type f -name '*.flac' | sort
+}
+
+partial_failed_tracks() {
+  local stage="$1"
+  local log_file="$2"
+  local src base raw num line n
+  declare -A completed=()
+  declare -A expected=()
+  declare -A failed=()
+
+  while IFS= read -r src; do
+    base="$(basename "$src")"
+    if [[ "$base" =~ ^([0-9]{1,3})[[:space:]]*-[[:space:]]*.*\.flac$ ]]; then
+      raw="${BASH_REMATCH[1]}"
+      num=$((10#$raw))
+      ((num == 0)) && continue
+      completed["$num"]=1
+    fi
+  done < <(list_staged_flacs "$stage")
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" =~ ripping[[:space:]]track[[:space:]]([0-9]+)[[:space:]]of[[:space:]]([0-9]+) ]]; then
+      num=$((10#${BASH_REMATCH[1]}))
+      ((num == 0)) && continue
+      expected["$num"]=1
+    fi
+    if [[ "$line" =~ giving[[:space:]]up[[:space:]]on[[:space:]]track[[:space:]]([0-9]+) ]]; then
+      num=$((10#${BASH_REMATCH[1]}))
+      ((num == 0)) && continue
+      expected["$num"]=1
+      failed["$num"]="track $num"
+    fi
+  done < "$log_file"
+
+  {
+    for n in "${!expected[@]}"; do
+      printf '%s\n' "$n"
+    done
+    for n in "${!failed[@]}"; do
+      printf '%s\n' "$n"
+    done
+  } | sort -n -u | while IFS= read -r n; do
+    [[ -n "$n" ]] || continue
+    if [[ -n "${failed[$n]:-}" ]]; then
+      printf '%s\n' "${failed[$n]}"
+    elif [[ -z "${completed[$n]:-}" ]]; then
+      printf 'track %s (missing or interrupted)\n' "$n"
+    fi
+  done
+}
+
+print_partial_rip_summary() {
+  local stage="$1"
+  local log_file="$2"
+  local src rel
+  local completed=()
+  local failed=()
+
+  mapfile -t completed < <(list_staged_flacs "$stage")
+  mapfile -t failed < <(partial_failed_tracks "$stage" "$log_file")
+
+  echo
+  echo "Partial rip summary:"
+  if ((${#completed[@]} > 0)); then
+    echo "  Completed FLAC files:"
+    for src in "${completed[@]}"; do
+      rel="${src#"$stage"/}"
+      echo "    $rel"
+    done
+  fi
+
+  if ((${#failed[@]} > 0)); then
+    echo "  Failed or suspect tracks:"
+    printf '    %s\n' "${failed[@]}"
+  else
+    echo "  Failed or suspect tracks: see Whipper output above."
+  fi
+}
+
+write_partial_rip_marker() {
+  local stage="$1"
+  local log_file="$2"
+  local marker_dir marker
+
+  marker_dir="$(find "$stage" -type d -name .whipper -print -quit)"
+  [[ -n "$marker_dir" ]] || return 0
+
+  marker="$marker_dir/PARTIAL_RIP.txt"
+  {
+    echo "PARTIAL RIP"
+    echo
+    echo "This album was published after Whipper failed to rip one or more tracks."
+    echo "Re-rip this CD later to replace or complete the missing tracks."
+    echo
+    echo "Published: $(date -Is)"
+    echo "Device: $DEVICE"
+    echo
+    print_partial_rip_summary "$stage" "$log_file"
+  } > "$marker"
+}
+
+publish_partial_rip_if_any() {
+  local stage="$1"
+  local dest="$2"
+  local log_file="$3"
+  local dirs=()
+  local flacs=()
+
+  mapfile -t flacs < <(list_staged_flacs "$stage")
+  if ((${#flacs[@]} == 0)); then
+    return 1
+  fi
+
+  mapfile -t dirs < <(find "$stage" -type f -name '*.flac' -printf '%h\n' | sort -u)
+
+  echo
+  echo "⚠ Warning: Whipper failed before completing the album, but some tracks were ripped."
+  print_partial_rip_summary "$stage" "$log_file"
+  write_partial_rip_marker "$stage" "$log_file"
+
+  echo "Post-processing partial rip..."
+  if [[ "$PAD_TRACK_NUMBERS" == "yes" && ${#dirs[@]} -gt 0 ]]; then
+    pad_tracks_in_dirs "${dirs[@]}"
+  fi
+  if [[ "$COVER_MODE" == "embed" || "$COVER_MODE" == "complete" ]]; then
+    postprocess_cover_art "${dirs[@]}"
+  fi
+
+  echo "Publishing partial rip into library..."
+  if publish_staged_output "$stage" "$dest"; then
+    echo
+    echo "⚠ Warning: Published a PARTIAL album. Re-rip this CD later to replace/complete the missing tracks."
+    eject_after_session "Partial rip"
+    return 0
+  fi
+
+  stage_out=""
+  return 1
+}
+
 rip_cd() {
   ensure_deps || return 1
   if [[ -z "$DEVICE" ]]; then
@@ -722,6 +954,9 @@ rip_cd() {
   echo "  Disc tpl:    $DT"
   echo "  Cover art:   $COVER_MODE"
   echo "  Retries:     $MAX_RETRIES"
+  if [[ "$MAX_RETRIES" =~ ^[0-9]+$ && "$MAX_RETRIES" -ge 5 ]]; then
+    echo "  Note:        badly damaged tracks can take a long time with 5 retries."
+  fi
   echo
   local RELEASE_ID=""
 
@@ -762,13 +997,14 @@ rip_cd() {
       args+=(--prompt)
     fi
     [[ "$ALLOW_UNKNOWN" == "yes" ]] && args+=(--unknown)
-    [[ "$KEEP_GOING" == "yes" ]] && args+=(--keep-going)
+    args+=(--keep-going)
     return 0
   }
 
   local args=()
   if [[ "$PROMPT_RELEASE" == "yes" ]]; then
     echo "Release tip: avoid bootlegs/box sets unless that is the disc you actually have."
+    echo "If MusicBrainz returns only one release, it will be selected automatically."
     echo "Choose by number below; the long MusicBrainz ID is shown only for reference."
     if choose_release_id; then
       echo
@@ -810,7 +1046,12 @@ rip_cd() {
           echo
           echo "✘ Fail: Rip failed on retry."
           diagnose_rip_failure "$run_log"
-          echo "   No cleanup touched your music directory."
+          if publish_partial_rip_if_any "$stage_out" "$OUT_ROOT" "$run_log"; then
+            rm -rf -- "$stage_out"
+            stage_out=""
+          else
+            echo "   No cleanup touched your music directory."
+          fi
           return "$rc"
         fi
       else
@@ -824,14 +1065,27 @@ rip_cd() {
       echo
       echo "✘ Fail: Rip failed."
       diagnose_rip_failure "$run_log"
-      echo "   No cleanup touched your music directory."
+      echo "Checking whether Whipper left a usable partial rip..."
+      if publish_partial_rip_if_any "$stage_out" "$OUT_ROOT" "$run_log"; then
+        rm -rf -- "$stage_out"
+        stage_out=""
+      else
+        echo "   No cleanup touched your music directory."
+      fi
       return "$rc"
     fi
   fi
 
   mapfile -t dirs < <(find "$stage_out" -type f -name '*.flac' -newer "$mark" -printf '%h\n' | sort -u)
 
+  local partial_rip="no"
+  if rip_log_has_failed_tracks "$run_log"; then
+    partial_rip="yes"
+    print_partial_rip_summary "$stage_out" "$run_log"
+  fi
+
   # Post-process: pad track numbers (optional)
+  echo "Post-processing staged rip..."
   if [[ "$PAD_TRACK_NUMBERS" == "yes" ]]; then
     if ((${#dirs[@]}>0)); then
       pad_tracks_in_dirs "${dirs[@]}"
@@ -842,6 +1096,7 @@ rip_cd() {
     postprocess_cover_art "${dirs[@]}"
   fi
 
+  echo "Publishing staged rip into library..."
   if publish_staged_output "$stage_out" "$OUT_ROOT"; then
     rm -rf -- "$stage_out"
     stage_out=""
@@ -850,17 +1105,14 @@ rip_cd() {
     return 1
   fi
 
-  # Optional eject
-  if [[ "$EJECT_AFTER" == "yes" ]]; then
-    if eject "$DEVICE" >/dev/null 2>&1; then
-      echo "Ejected: $DEVICE"
-    else
-      echo "⚠ Warning:  Rip succeeded, but eject failed for $DEVICE."
-    fi
-  fi
+  eject_after_session "Rip"
 
   echo
-  echo "✔ Done."
+  if [[ "$partial_rip" == "yes" ]]; then
+    echo "⚠ Warning: Done, but this is a PARTIAL album. Re-rip this CD later to replace/complete missing tracks."
+  else
+    echo "✔ Done."
+  fi
   echo "Tip: disc artefacts (.log/.cue/.m3u) are stored under each album's: .whipper/"
 }
 
@@ -898,6 +1150,7 @@ main_menu() {
 }
 
 load_cfg
+KEEP_GOING="yes"
 while true; do
   main_menu
 done
