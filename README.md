@@ -18,6 +18,7 @@ It helps with:
 - safe AccurateRip offset detection for Whipper 0.10.0
 - numbered MusicBrainz release selection
 - keep-going ripping so one failed track does not discard the rest of the album
+- Plex/exFAT-safe path sanitising before publishing
 - FLAC ripping with MusicBrainz metadata
 - embedded and saved cover art
 - Plex-style output:
@@ -69,7 +70,7 @@ You do not need to repeat drive setup every time. Whipper saves the drive offset
 
 ## Safety Notes
 
-The wizard stages each rip in `/tmp` first. After Whipper finishes, it copies the staged files into your music library only if doing so will not overwrite existing files.
+The wizard stages each rip in `/tmp` first. Before publishing, it renames staged paths to avoid characters that commonly break exFAT/Windows-compatible drives, such as `:`, `?`, `*`, `"`, `<`, `>`, `\`, and `|`. After that, it copies the staged files into your music library only if doing so will not overwrite existing files.
 
 If one or more tracks fail but other tracks were ripped, the wizard publishes a clearly labelled partial album, prints a completed/failed summary, and writes `.whipper/PARTIAL_RIP.txt`. This preserves useful work while making it obvious that the album still needs attention.
 

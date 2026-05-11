@@ -679,6 +679,107 @@ copy_album_cover_for_plex() {
   fi
 }
 
+sanitize_path_component() {
+  local name="$1"
+  local safe upper stem
+
+  safe="$name"
+  safe="${safe//:/ -}"
+  safe="${safe//\?/}"
+  safe="${safe//\*/}"
+  safe="${safe//\"/}"
+  safe="${safe//</(}"
+  safe="${safe//>/)}"
+  safe="${safe//\\/ -}"
+  safe="${safe//|/ -}"
+  safe="${safe//$'\r'/ }"
+  safe="${safe//$'\n'/ }"
+  safe="${safe//$'\t'/ }"
+
+  while [[ "$safe" == *"  "* ]]; do
+    safe="${safe//  / }"
+  done
+  while [[ "$safe" == " "* ]]; do
+    safe="${safe# }"
+  done
+  while [[ "$safe" == *" " ]]; do
+    safe="${safe% }"
+  done
+  while [[ "$safe" == *"." ]]; do
+    safe="${safe%.}"
+  done
+
+  [[ -n "$safe" ]] || safe="_"
+
+  upper="${safe^^}"
+  stem="${upper%%.*}"
+  case "$stem" in
+    CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9]) safe="_$safe" ;;
+  esac
+
+  printf '%s\n' "$safe"
+}
+
+unique_sanitized_target() {
+  local dir="$1"
+  local name="$2"
+  local original="$3"
+  local stem ext target i
+
+  target="$dir/$name"
+  if [[ "$target" == "$original" || ! -e "$target" ]]; then
+    printf '%s\n' "$target"
+    return 0
+  fi
+
+  if [[ "$name" == *.* && "$name" != .* ]]; then
+    stem="${name%.*}"
+    ext=".${name##*.}"
+  else
+    stem="$name"
+    ext=""
+  fi
+
+  i=2
+  while :; do
+    target="$dir/$stem ($i)$ext"
+    if [[ ! -e "$target" ]]; then
+      printf '%s\n' "$target"
+      return 0
+    fi
+    ((i += 1))
+  done
+}
+
+sanitize_tree_for_plex() {
+  local root="$1"
+  local path dir base safe target rel_old rel_new
+  local renamed=0
+  local paths=()
+
+  [[ -d "$root" ]] || return 0
+
+  mapfile -d '' paths < <(find "$root" -depth -mindepth 1 -print0)
+  for path in "${paths[@]}"; do
+    [[ -e "$path" ]] || continue
+    dir="$(dirname "$path")"
+    base="$(basename "$path")"
+    safe="$(sanitize_path_component "$base")"
+    [[ "$safe" != "$base" ]] || continue
+
+    target="$(unique_sanitized_target "$dir" "$safe" "$path")"
+    rel_old="${path#"$root"/}"
+    rel_new="${target#"$root"/}"
+    mv -- "$path" "$target"
+    echo "Renamed for Plex/exFAT: $rel_old -> $rel_new"
+    ((renamed += 1))
+  done
+
+  if ((renamed > 0)); then
+    echo "Sanitized $renamed path name(s) for Plex/exFAT compatibility."
+  fi
+}
+
 eject_after_session() {
   local label="${1:-session}"
 
@@ -904,6 +1005,9 @@ publish_partial_rip_if_any() {
     return 1
   fi
 
+  echo "Sanitizing staged paths for Plex/exFAT..."
+  sanitize_tree_for_plex "$stage"
+  mapfile -t flacs < <(list_staged_flacs "$stage")
   mapfile -t dirs < <(find "$stage" -type f -name '*.flac' -printf '%h\n' | sort -u)
 
   echo
@@ -1076,6 +1180,8 @@ rip_cd() {
     fi
   fi
 
+  echo "Sanitizing staged paths for Plex/exFAT..."
+  sanitize_tree_for_plex "$stage_out"
   mapfile -t dirs < <(find "$stage_out" -type f -name '*.flac' -newer "$mark" -printf '%h\n' | sort -u)
 
   local partial_rip="no"
