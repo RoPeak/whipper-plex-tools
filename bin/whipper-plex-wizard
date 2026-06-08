@@ -17,9 +17,12 @@ PROMPT_RELEASE="${PROMPT_RELEASE:-yes}" # yes/no
 ALLOW_UNKNOWN="${ALLOW_UNKNOWN:-no}"    # yes/no
 KEEP_GOING="${KEEP_GOING:-yes}"         # yes/no
 MAX_RETRIES="${MAX_RETRIES:-5}"         # 0 = infinity
+DAMAGED_MAX_RETRIES="${DAMAGED_MAX_RETRIES:-1}" # damaged disc salvage mode
 PAD_TRACK_NUMBERS="${PAD_TRACK_NUMBERS:-yes}" # yes/no
 EJECT_AFTER="${EJECT_AFTER:-no}"        # yes/no
 EJECT_TIMEOUT_SECONDS=15
+BAD_DISC_TRACK_Q_THRESHOLD=1000
+BAD_DISC_TOTAL_Q_THRESHOLD=5000
 
 # Whipper 0.10.0/cdparanoia can crash while trying some high offsets.
 # Keep automatic search to common offsets with absolute values <= 587.
@@ -36,7 +39,7 @@ cfg_is_safe() {
     key="${line%%=*}"
     value="${line#*=}"
     case "$key" in
-      DEVICE|OUT_ROOT|MULTIDISC|INCLUDE_TRACK_ARTIST|COVER_MODE|PROMPT_RELEASE|ALLOW_UNKNOWN|KEEP_GOING|MAX_RETRIES|PAD_TRACK_NUMBERS|EJECT_AFTER) ;;
+      DEVICE|OUT_ROOT|MULTIDISC|INCLUDE_TRACK_ARTIST|COVER_MODE|PROMPT_RELEASE|ALLOW_UNKNOWN|KEEP_GOING|MAX_RETRIES|DAMAGED_MAX_RETRIES|PAD_TRACK_NUMBERS|EJECT_AFTER) ;;
       *) return 1 ;;
     esac
 
@@ -107,10 +110,22 @@ looks_like_cover_art_network_failure() {
   grep -Eq 'getCoverArt|Cover Art Archive|musicbrainzngs\.musicbrainz\.NetworkError|HTTP Error 30[0-9]' "$log_file"
 }
 
+offset_find_confirmed() {
+  local log_file="$1"
+
+  grep -Eq 'Read offset of device is:|adding read offset to configuration file' "$log_file"
+}
+
 rip_log_has_failed_tracks() {
   local log_file="$1"
 
   grep -Eq "giving up on track [0-9]+" "$log_file"
+}
+
+stage_has_flacs() {
+  local stage="$1"
+
+  find "$stage" -type f -name '*.flac' -print -quit | grep -q .
 }
 
 diagnose_rip_failure() {
@@ -119,8 +134,13 @@ diagnose_rip_failure() {
   if looks_like_cover_art_network_failure "$log_file"; then
     echo "   Cause: Whipper failed while fetching cover art."
     echo "   Try the cover-art-free retry when offered."
+  elif grep -Eq "unsupported operand type\(s\) for /: 'NoneType' and 'float'" "$log_file"; then
+    echo "   Cause: Whipper 0.10.0 crashed while writing its rip log after failed/unreadable tracks."
+    echo "   The audio failure happened earlier; the traceback is a Whipper logging bug around missing track data."
+    echo "   Keep any staged partial rip if useful, and inspect the completed/failed track summary."
   elif grep -Eq "giving up on track|couldn't read any frames|file size 0 did not match expected size" "$log_file"; then
     echo "   Cause: cdparanoia could not get a usable read for at least one track."
+    echo "   Note: Whipper 0.10.0 can print a ZeroDivisionError traceback for this known unreadable-frame failure mode."
     echo "   Try cleaning the disc, reinserting it, and ripping again."
     echo "   If this happens repeatedly on the same track, try another drive or inspect the disc for damage."
   elif grep -Eq "requested release id .* none of the found releases match" "$log_file"; then
@@ -307,6 +327,7 @@ save_cfg() {
     printf 'ALLOW_UNKNOWN=%q\n' "$ALLOW_UNKNOWN"
     printf 'KEEP_GOING=%q\n' "$KEEP_GOING"
     printf 'MAX_RETRIES=%q\n' "$MAX_RETRIES"
+    printf 'DAMAGED_MAX_RETRIES=%q\n' "$DAMAGED_MAX_RETRIES"
     printf 'PAD_TRACK_NUMBERS=%q\n' "$PAD_TRACK_NUMBERS"
     printf 'EJECT_AFTER=%q\n' "$EJECT_AFTER"
   } > "$CFG_FILE"
@@ -415,6 +436,7 @@ edit_prefs() {
   echo "  Allow unknown discs:   $ALLOW_UNKNOWN"
   echo "  Keep going on errors:  yes (always; preserves partial albums)"
   echo "  Max retries/track:     $MAX_RETRIES"
+  echo "  Damaged mode retries:  $DAMAGED_MAX_RETRIES"
   echo "  Pad track numbers:     $PAD_TRACK_NUMBERS"
   echo "  Eject after rip:       $EJECT_AFTER"
   echo
@@ -475,6 +497,15 @@ edit_prefs() {
     fi
   fi
 
+  read -rp "Damaged disc max retries per track (ENTER to keep: $DAMAGED_MAX_RETRIES): " v
+  if [[ -n "${v:-}" ]]; then
+    if is_nonneg_int "$v"; then
+      DAMAGED_MAX_RETRIES="$v"
+    else
+      echo "Keeping $DAMAGED_MAX_RETRIES (damaged retries must be a non-negative integer)."
+    fi
+  fi
+
   read -rp "Pad track numbers to 01/02/... after ripping? [Y/n] " v
   if [[ -n "${v:-}" ]]; then
     if new="$(coerce_yes_no "$v" yes)"; then
@@ -484,7 +515,7 @@ edit_prefs() {
     fi
   fi
 
-  read -rp "Eject tray after successful rip? [y/N] " v
+  read -rp "Eject tray after rip or published partial rip? [y/N] " v
   if [[ -n "${v:-}" ]]; then
     if new="$(coerce_yes_no "$v" no)"; then
       EJECT_AFTER="$new"
@@ -536,9 +567,13 @@ drive_setup() {
       echo
       echo "Insert a common CD (likely in AccurateRip), then press ENTER."
       read -r
-      if whipper offset find -d "$DEVICE" -o "$SAFE_OFFSET_SEARCH"; then
+      local offset_log
+      offset_log="$(mktemp -t whipper-offset-XXXXXX.log)"
+      if run_logged "$offset_log" whipper offset find -d "$DEVICE" -o "$SAFE_OFFSET_SEARCH" && offset_find_confirmed "$offset_log"; then
+        rm -f -- "$offset_log"
         echo "✔ Done (confirmed offsets are saved into whipper.conf automatically)."
       else
+        rm -f -- "$offset_log"
         echo "✘ Fail: Offset detection failed."
         echo "   Try a different common CD, clean the disc, or use option 3 if you know the offset."
         return 1
@@ -559,9 +594,13 @@ drive_setup() {
       fi
       echo "Insert a common CD (likely in AccurateRip), then press ENTER."
       read -r
-      if whipper offset find -d "$DEVICE" -o "$off"; then
+      local offset_log
+      offset_log="$(mktemp -t whipper-offset-XXXXXX.log)"
+      if run_logged "$offset_log" whipper offset find -d "$DEVICE" -o "$off" && offset_find_confirmed "$offset_log"; then
+        rm -f -- "$offset_log"
         echo "✔ Done (confirmed offsets are saved into whipper.conf automatically)."
       else
+        rm -f -- "$offset_log"
         echo "✘ Fail: Offset verification failed for $off"
         return 1
       fi
@@ -684,7 +723,7 @@ sanitize_path_component() {
   local safe upper stem
 
   safe="$name"
-  safe="${safe//:/ -}"
+  safe="${safe//:/ - }"
   safe="${safe//\?/}"
   safe="${safe//\*/}"
   safe="${safe//\"/}"
@@ -845,10 +884,237 @@ postprocess_cover_art() {
   done
 }
 
+format_duration() {
+  local seconds="$1"
+  local h m s
+
+  h=$((seconds / 3600))
+  m=$(((seconds % 3600) / 60))
+  s=$((seconds % 60))
+  if ((h > 0)); then
+    printf '%dh %02dm %02ds\n' "$h" "$m" "$s"
+  elif ((m > 0)); then
+    printf '%dm %02ds\n' "$m" "$s"
+  else
+    printf '%ds\n' "$s"
+  fi
+}
+
+track_number_from_path() {
+  local path="$1"
+  local base raw
+
+  base="$(basename "$path")"
+  if [[ "$base" =~ ^([0-9]{1,3})[[:space:]]*-[[:space:]]*.*\.flac$ ]]; then
+    raw="${BASH_REMATCH[1]}"
+    printf '%s\n' "$((10#$raw))"
+    return 0
+  fi
+  return 1
+}
+
+track_score_from_log() {
+  local log_file="$1"
+  local track="$2"
+  local padded
+
+  padded="$(printf '%2d' "$track")"
+  if grep -Eq "track[[:space:]]+$padded:[[:space:]]+rip accurate" "$log_file"; then
+    echo 3
+  elif grep -Eq "track[[:space:]]+$padded:[[:space:]]+rip NOT accurate" "$log_file"; then
+    echo 2
+  elif grep -Eq "track[[:space:]]+$padded:[[:space:]]+unknown[[:space:]]+\\(error\\)" "$log_file"; then
+    echo 0
+  else
+    echo 1
+  fi
+}
+
+count_lines() {
+  local input="$1"
+
+  if [[ -z "$input" ]]; then
+    echo 0
+  else
+    printf '%s\n' "$input" | wc -l
+  fi
+}
+
+count_flacs() {
+  local stage="$1"
+
+  [[ -d "$stage" ]] || {
+    echo 0
+    return 0
+  }
+  find "$stage" -type f -name '*.flac' | wc -l
+}
+
+accurip_count() {
+  local log_file="$1"
+  local pattern="$2"
+
+  [[ -f "$log_file" ]] || {
+    echo 0
+    return 0
+  }
+  grep -Ec "$pattern" "$log_file" || true
+}
+
+copy_with_parents() {
+  local src="$1"
+  local from="$2"
+  local to="$3"
+  local rel target
+
+  rel="${src#"$from"/}"
+  target="$to/$rel"
+  mkdir -p "$(dirname "$target")"
+  cp -p -- "$src" "$target"
+}
+
+conflict_safe_path() {
+  local target="$1"
+  local stamp="$2"
+  local dir base stem ext candidate i
+
+  dir="$(dirname "$target")"
+  base="$(basename "$target")"
+  if [[ "$base" == *.* && "$base" != .* ]]; then
+    stem="${base%.*}"
+    ext=".${base##*.}"
+  else
+    stem="$base"
+    ext=""
+  fi
+
+  candidate="$dir/$stem.attempt-$stamp$ext"
+  i=2
+  while [[ -e "$candidate" ]]; do
+    candidate="$dir/$stem.attempt-$stamp-$i$ext"
+    ((i += 1))
+  done
+  printf '%s\n' "$candidate"
+}
+
+find_partial_album_dir_for_conflicts() {
+  local dest="$1"
+  shift
+  local rel target dir
+
+  for rel in "$@"; do
+    target="$dest/$rel"
+    dir="$(dirname "$target")"
+    while [[ "$dir" == "$dest"* && "$dir" != "$dest" && "$dir" != "/" ]]; do
+      if [[ -f "$dir/.whipper/PARTIAL_RIP.txt" ]]; then
+        printf '%s\n' "$dir"
+        return 0
+      fi
+      dir="$(dirname "$dir")"
+    done
+  done
+  return 1
+}
+
+build_merged_stage() {
+  local merged="$1"
+  shift
+  local entries=("$@")
+  local entry stage log mode src rel track score current_score stamp target
+  declare -A best_src=()
+  declare -A best_stage=()
+  declare -A best_score=()
+  local files=()
+
+  mkdir -p "$merged"
+
+  for entry in "${entries[@]}"; do
+    IFS='|' read -r stage log mode <<< "$entry"
+    [[ -d "$stage" ]] || continue
+    mapfile -t files < <(find "$stage" -type f -name '*.flac' | sort)
+    for src in "${files[@]}"; do
+      track="$(track_number_from_path "$src" || true)"
+      [[ -n "$track" ]] || continue
+      score="$(track_score_from_log "$log" "$track")"
+      current_score="${best_score[$track]:--1}"
+      if ((score > current_score)); then
+        best_score["$track"]="$score"
+        best_src["$track"]="$src"
+        best_stage["$track"]="$stage"
+      fi
+    done
+  done
+
+  for track in "${!best_src[@]}"; do
+    copy_with_parents "${best_src[$track]}" "${best_stage[$track]}" "$merged"
+  done
+
+  for entry in "${entries[@]}"; do
+    IFS='|' read -r stage log mode <<< "$entry"
+    [[ -d "$stage" ]] || continue
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    mapfile -t files < <(find "$stage" -type f ! -name '*.flac' | sort)
+    for src in "${files[@]}"; do
+      rel="${src#"$stage"/}"
+      target="$merged/$rel"
+      mkdir -p "$(dirname "$target")"
+      if [[ -e "$target" && "$rel" == */.whipper/* ]]; then
+        target="$(conflict_safe_path "$target" "$stamp")"
+      elif [[ -e "$target" ]]; then
+        continue
+      fi
+      cp -p -- "$src" "$target"
+    done
+  done
+}
+
+print_session_summary() {
+  local start_time="$1"
+  local status_label="$2"
+  local release_id="$3"
+  local modes="$4"
+  local stage="$5"
+  local log_file="$6"
+  local retry_outcome="$7"
+  local kept_paths="$8"
+  local elapsed completed failed accurate not_accurate unknown_error
+  local published="${SESSION_PUBLISHED_FILES:-0}"
+  local conflicts="${SESSION_CONFLICTS:-0}"
+
+  elapsed="$(format_duration "$(($(date +%s) - start_time))")"
+  completed="$(count_flacs "$stage")"
+  mapfile -t failed < <(partial_failed_tracks "$stage" "$log_file" 2>/dev/null || true)
+  accurate="$(accurip_count "$log_file" 'track[[:space:]]+[0-9]+:[[:space:]]+rip accurate')"
+  not_accurate="$(accurip_count "$log_file" 'track[[:space:]]+[0-9]+:[[:space:]]+rip NOT accurate')"
+  unknown_error="$(accurip_count "$log_file" 'track[[:space:]]+[0-9]+:[[:space:]]+unknown[[:space:]]+\(error\)')"
+
+  echo
+  echo "Session summary:"
+  echo "  Status:              $status_label"
+  echo "  Elapsed:             $elapsed"
+  echo "  Mode(s):             ${modes:-unknown}"
+  echo "  Release ID:          ${release_id:-<not selected>}"
+  echo "  Completed FLACs:     $completed"
+  echo "  Published files:     $published"
+  echo "  Conflicts/skipped:   $conflicts"
+  echo "  AccurateRip:         accurate $accurate, not accurate $not_accurate, unknown/error $unknown_error"
+  echo "  Retry outcome:       ${retry_outcome:-none}"
+  if ((${#failed[@]} > 0)); then
+    echo "  Failed/suspect:"
+    printf '    %s\n' "${failed[@]}"
+  else
+    echo "  Failed/suspect:      none detected"
+  fi
+  if [[ -n "${kept_paths:-}" ]]; then
+    echo "  Kept staging paths:"
+    printf '    %s\n' $kept_paths
+  fi
+}
+
 publish_staged_output() {
   local stage="$1"
   local dest="$2"
-  local src rel target
+  local src rel target partial_album stamp repair_target copied=0 skipped=0
   local conflicts=()
   local files=()
 
@@ -868,6 +1134,36 @@ publish_staged_output() {
   done
 
   if ((${#conflicts[@]} > 0)); then
+    partial_album="$(find_partial_album_dir_for_conflicts "$dest" "${conflicts[@]}" || true)"
+    if [[ -n "$partial_album" ]]; then
+      echo
+      echo "Existing partial album found; repairing additively without overwriting files:"
+      echo "  $partial_album"
+      stamp="$(date +%Y%m%d-%H%M%S)"
+      for src in "${files[@]}"; do
+        rel="${src#"$stage"/}"
+        target="$dest/$rel"
+        if [[ -e "$target" ]]; then
+          if [[ "$rel" == */.whipper/* && "$rel" != */.whipper/cover.* ]]; then
+            repair_target="$(conflict_safe_path "$target" "$stamp")"
+            mkdir -p "$(dirname "$repair_target")"
+            cp -p -- "$src" "$repair_target"
+            ((copied += 1))
+          else
+            ((skipped += 1))
+          fi
+          continue
+        fi
+        mkdir -p "$(dirname "$target")"
+        cp -p -- "$src" "$target"
+        ((copied += 1))
+      done
+      SESSION_PUBLISHED_FILES=$((SESSION_PUBLISHED_FILES + copied))
+      SESSION_CONFLICTS=$((SESSION_CONFLICTS + skipped))
+      echo "Repair copied $copied new file(s), skipped $skipped existing file(s)."
+      return 0
+    fi
+
     echo
     echo "✘ Fail: Not copying this rip into your library because these files already exist:"
     printf '  %s\n' "${conflicts[@]}"
@@ -875,6 +1171,7 @@ publish_staged_output() {
     echo "Staged rip kept here:"
     echo "  $stage"
     echo "Move or rename files manually after checking them, then delete the staging folder when done."
+    SESSION_CONFLICTS=$((SESSION_CONFLICTS + ${#conflicts[@]}))
     return 1
   fi
 
@@ -883,8 +1180,10 @@ publish_staged_output() {
     target="$dest/$rel"
     mkdir -p "$(dirname "$target")"
     cp -p -- "$src" "$target"
+    ((copied += 1))
   done
 
+  SESSION_PUBLISHED_FILES=$((SESSION_PUBLISHED_FILES + copied))
   echo "Published rip into library: $dest"
   return 0
 }
@@ -1036,6 +1335,7 @@ publish_partial_rip_if_any() {
 }
 
 rip_cd() {
+  local damaged_mode="${1:-no}"
   ensure_deps || return 1
   if [[ -z "$DEVICE" ]]; then
     pick_device || return 1
@@ -1050,6 +1350,41 @@ rip_cd() {
   TT="$(track_template)"
   DT="$(disc_template)"
 
+  local start_time release_modes retry_outcome kept_paths final_status log yn
+  local RELEASE_ID="" final_stage="" final_log="" merged_stage="" merged_log="" rc=0
+  local attempt_entries=()
+  local attempt_stages=()
+  local attempt_logs=()
+  local work_dirs=()
+  local dirs=()
+  SESSION_PUBLISHED_FILES=0
+  SESSION_CONFLICTS=0
+  start_time="$(date +%s)"
+  release_modes=""
+  retry_outcome="none"
+  kept_paths=""
+
+  cleanup_rip_tmp() {
+    local path keep
+    for path in "${work_dirs[@]:-}"; do
+      [[ -n "$path" && "$path" == /tmp/whipper-work-* ]] && rm -rf -- "$path"
+    done
+    for path in "${attempt_logs[@]:-}" "$merged_log"; do
+      [[ -n "$path" ]] && rm -f -- "$path"
+    done
+    for path in "${attempt_stages[@]:-}" "$merged_stage"; do
+      [[ -n "$path" && "$path" == /tmp/whipper-out-* ]] || continue
+      keep="no"
+      if [[ -n "${kept_paths:-}" ]]; then
+        while IFS= read -r kept; do
+          [[ "$path" == "$kept" ]] && keep="yes"
+        done <<< "$kept_paths"
+      fi
+      [[ "$keep" == "yes" ]] || rm -rf -- "$path"
+    done
+  }
+  trap 'cleanup_rip_tmp; trap - RETURN' RETURN
+
   echo
   echo "Ripping with:"
   echo "  Device:      $DEVICE"
@@ -1057,43 +1392,88 @@ rip_cd() {
   echo "  Track tpl:   $TT"
   echo "  Disc tpl:    $DT"
   echo "  Cover art:   $COVER_MODE"
-  echo "  Retries:     $MAX_RETRIES"
-  if [[ "$MAX_RETRIES" =~ ^[0-9]+$ && "$MAX_RETRIES" -ge 5 ]]; then
-    echo "  Note:        badly damaged tracks can take a long time with 5 retries."
+  if [[ "$damaged_mode" == "yes" ]]; then
+    echo "  Retries:     $DAMAGED_MAX_RETRIES"
+    echo "  Mode:        damaged disc"
+    echo "Damaged disc mode: using $DAMAGED_MAX_RETRIES max retry/retries per track to avoid long stalls."
+  else
+    echo "  Retries:     $MAX_RETRIES"
+    if [[ "$MAX_RETRIES" =~ ^[0-9]+$ && "$MAX_RETRIES" -ge 5 ]]; then
+      echo "  Note:        badly damaged tracks can take a long time with $MAX_RETRIES retries."
+    fi
   fi
   echo
-  local RELEASE_ID=""
 
-  local mark work stage_out run_log rc
-  local dirs=()
-  mark="$(mktemp)"
-  touch "$mark"
-  work="$(mktemp -d -t whipper-work-XXXXXX)"
-  stage_out="$(mktemp -d -t whipper-out-XXXXXX)"
-  run_log="$(mktemp -t whipper-run-XXXXXX.log)"
-  cleanup_rip_tmp() {
-    [[ -n "${mark:-}" ]] && rm -f -- "$mark"
-    [[ -n "${run_log:-}" ]] && rm -f -- "$run_log"
-    if [[ -n "${work:-}" && "$work" == /tmp/whipper-work-* ]]; then
-      rm -rf -- "$work"
-    fi
-    if [[ -n "${stage_out:-}" && "$stage_out" == /tmp/whipper-out-* ]]; then
-      rm -rf -- "$stage_out"
-    fi
+  run_logged_with_bad_disc_watch() {
+    local log_file="$1"
+    local allow_prompt="$2"
+    shift 2
+    local line status pid yn
+    local q_errors q_track q_total=0 q_prompted="no"
+    BAD_DISC_ABORTED="no"
+    : > "$log_file"
+
+    set +e
+    coproc WPW_RIP { "$@" 2>&1; }
+    pid="$WPW_RIP_PID"
+    while IFS= read -r line <&"${WPW_RIP[0]}"; do
+      printf '%s\n' "$line" | tee -a "$log_file"
+      if [[ "$allow_prompt" == "yes" && "$q_prompted" == "no" && "$line" =~ Track[[:space:]]+([0-9]+)[[:space:]]+finished,[[:space:]]+found[[:space:]]+([0-9]+)[[:space:]]+Q[[:space:]]sub-channels[[:space:]]with[[:space:]]CRC[[:space:]]errors ]]; then
+        q_track="${BASH_REMATCH[1]}"
+        q_errors="${BASH_REMATCH[2]}"
+        q_total=$((q_total + q_errors))
+        if ((q_errors >= BAD_DISC_TRACK_Q_THRESHOLD || q_total >= BAD_DISC_TOTAL_Q_THRESHOLD)); then
+          q_prompted="yes"
+          echo
+          echo "⚠ Warning: This disc is reporting very high sub-channel CRC errors."
+          echo "   Track $q_track reported $q_errors errors; current total is $q_total."
+          if [[ -r /dev/tty ]] && read -rp "Stop this normal attempt and restart in damaged disc mode? [Y/n] " yn </dev/tty; then
+            if ! is_no "${yn:-}"; then
+              BAD_DISC_ABORTED="yes"
+              kill "$pid" >/dev/null 2>&1
+              break
+            fi
+          else
+            echo "   No interactive terminal is available; continuing the current attempt."
+          fi
+        fi
+      fi
+    done
+    wait "$pid"
+    status=$?
+    set -e
+    return "$status"
   }
-  trap 'cleanup_rip_tmp; trap - RETURN' RETURN
 
-  build_rip_args() {
+  run_attempt() {
     local cover_mode="$1"
-    args=(
-        cd -d "$DEVICE" rip
-        --output-directory "$stage_out"
-        --working-directory "$work"
-        --track-template "$TT"
-        --disc-template "$DT"
-        --max-retries "$MAX_RETRIES"
-    )
+    local mode="$2"
+    local stage work log retry_limit allow_bad_disc_prompt status
+    local args=()
 
+    stage="$(mktemp -d -t whipper-out-XXXXXX)"
+    work="$(mktemp -d -t whipper-work-XXXXXX)"
+    log="$(mktemp -t whipper-run-XXXXXX.log)"
+    attempt_stages+=("$stage")
+    attempt_logs+=("$log")
+    work_dirs+=("$work")
+
+    retry_limit="$MAX_RETRIES"
+    allow_bad_disc_prompt="no"
+    if [[ "$mode" == "damaged" ]]; then
+      retry_limit="$DAMAGED_MAX_RETRIES"
+    elif [[ "$damaged_mode" != "yes" ]]; then
+      allow_bad_disc_prompt="yes"
+    fi
+
+    args=(
+      cd -d "$DEVICE" rip
+      --output-directory "$stage"
+      --working-directory "$work"
+      --track-template "$TT"
+      --disc-template "$DT"
+      --max-retries "$retry_limit"
+    )
     [[ "$cover_mode" != "none" ]] && args+=(--cover-art "$cover_mode")
     if [[ -n "$RELEASE_ID" ]]; then
       args+=(--release-id "$RELEASE_ID")
@@ -1102,10 +1482,16 @@ rip_cd() {
     fi
     [[ "$ALLOW_UNKNOWN" == "yes" ]] && args+=(--unknown)
     args+=(--keep-going)
-    return 0
+
+    release_modes="${release_modes:+$release_modes, }$mode"
+    attempt_entries+=("$stage|$log|$mode")
+    run_logged_with_bad_disc_watch "$log" "$allow_bad_disc_prompt" whipper "${args[@]}"
+    status=$?
+    final_stage="$stage"
+    final_log="$log"
+    return "$status"
   }
 
-  local args=()
   if [[ "$PROMPT_RELEASE" == "yes" ]]; then
     echo "Release tip: avoid bootlegs/box sets unless that is the disc you actually have."
     echo "If MusicBrainz returns only one release, it will be selected automatically."
@@ -1118,108 +1504,192 @@ rip_cd() {
       echo
     fi
   fi
-  build_rip_args "$COVER_MODE"
 
-  # Run
-  if run_logged "$run_log" whipper "${args[@]}"; then
-    :
+  if [[ "$damaged_mode" == "yes" ]]; then
+    if run_attempt "$COVER_MODE" damaged; then
+      rc=0
+    else
+      rc=$?
+    fi
   else
-    rc=$?
-    if looks_like_cover_art_network_failure "$run_log"; then
-      echo
-      echo "⚠ Warning:  Whipper failed while fetching cover art, before completing the rip."
-      read -rp "Retry this rip without Whipper cover-art fetching? [Y/n] " retry_coverless
-      if ! is_no "${retry_coverless:-}"; then
-        if [[ "$stage_out" == /tmp/whipper-out-* ]]; then
-          rm -rf -- "$stage_out"
-        fi
-        if [[ "$work" == /tmp/whipper-work-* ]]; then
-          rm -rf -- "$work"
-        fi
-        work="$(mktemp -d -t whipper-work-XXXXXX)"
-        stage_out="$(mktemp -d -t whipper-out-XXXXXX)"
-        : > "$run_log"
+    if run_attempt "$COVER_MODE" normal; then
+      rc=0
+    else
+      rc=$?
+      if [[ "${BAD_DISC_ABORTED:-no}" == "yes" ]]; then
+        retry_outcome="normal attempt stopped after bad-disc warning; damaged mode attempted"
         echo
-        echo "Retrying without --cover-art. Audio metadata and AccurateRip verification still apply."
-        echo
-        build_rip_args none
-        if run_logged "$run_log" whipper "${args[@]}"; then
-          :
+        echo "Restarting in damaged disc mode."
+        if run_attempt "$COVER_MODE" damaged; then
+          rc=0
         else
           rc=$?
-          echo
-          echo "✘ Fail: Rip failed on retry."
-          diagnose_rip_failure "$run_log"
-          if publish_partial_rip_if_any "$stage_out" "$OUT_ROOT" "$run_log"; then
-            rm -rf -- "$stage_out"
-            stage_out=""
-          else
-            echo "   No cleanup touched your music directory."
-          fi
-          return "$rc"
         fi
-      else
+      elif looks_like_cover_art_network_failure "$final_log"; then
         echo
-        echo "✘ Fail: Rip failed."
-        diagnose_rip_failure "$run_log"
-        echo "   No cleanup touched your music directory."
-        return "$rc"
+        echo "⚠ Warning:  Whipper failed while fetching cover art, before completing the rip."
+        read -rp "Retry this rip without Whipper cover-art fetching? [Y/n] " retry_coverless
+        if ! is_no "${retry_coverless:-}"; then
+          retry_outcome="cover-art-free retry attempted"
+          echo
+          echo "Retrying without --cover-art. Audio metadata and AccurateRip verification still apply."
+          echo
+          if run_attempt none normal; then
+            rc=0
+          else
+            rc=$?
+          fi
+        fi
       fi
-    else
-      echo
-      echo "✘ Fail: Rip failed."
-      diagnose_rip_failure "$run_log"
-      echo "Checking whether Whipper left a usable partial rip..."
-      if publish_partial_rip_if_any "$stage_out" "$OUT_ROOT" "$run_log"; then
-        rm -rf -- "$stage_out"
-        stage_out=""
-      else
-        echo "   No cleanup touched your music directory."
+
+      if [[ "${BAD_DISC_ABORTED:-no}" != "yes" && "$rc" -ne 0 && "$damaged_mode" != "yes" && "$(count_flacs "$final_stage")" -gt 0 ]] && rip_log_has_failed_tracks "$final_log"; then
+        echo
+        echo "This looks like a damaged disc."
+        read -rp "Retry once in damaged disc mode before publishing the partial rip? [Y/n] " yn
+        if ! is_no "${yn:-}"; then
+          retry_outcome="damaged mode retry attempted"
+          echo
+          echo "Retrying in damaged disc mode: using $DAMAGED_MAX_RETRIES max retry/retries per track."
+          echo
+          if run_attempt "$COVER_MODE" damaged; then
+            rc=0
+          else
+            rc=$?
+          fi
+        fi
       fi
-      return "$rc"
     fi
+  fi
+
+  if ((${#attempt_entries[@]} > 1)); then
+    merged_stage="$(mktemp -d -t whipper-out-XXXXXX)"
+    merged_log="$(mktemp -t whipper-run-merged-XXXXXX.log)"
+    build_merged_stage "$merged_stage" "${attempt_entries[@]}"
+    for log in "${attempt_logs[@]}"; do
+      printf '\n===== %s =====\n' "$log" >> "$merged_log"
+      cat "$log" >> "$merged_log"
+    done
+    final_stage="$merged_stage"
+    final_log="$merged_log"
+  fi
+
+  if [[ "$rc" -ne 0 ]]; then
+    echo
+    if [[ "$retry_outcome" == *"damaged"* ]]; then
+      echo "✘ Fail: Damaged disc retry also failed."
+    else
+      echo "✘ Fail: Rip failed."
+    fi
+    diagnose_rip_failure "$final_log"
+  fi
+
+  if ! stage_has_flacs "$final_stage"; then
+    echo "   No usable FLAC files were staged."
+    final_status="failed - no audio published"
+    print_session_summary "$start_time" "$final_status" "$RELEASE_ID" "$release_modes" "$final_stage" "$final_log" "$retry_outcome" ""
+    return "${rc:-1}"
   fi
 
   echo "Sanitizing staged paths for Plex/exFAT..."
-  sanitize_tree_for_plex "$stage_out"
-  mapfile -t dirs < <(find "$stage_out" -type f -name '*.flac' -newer "$mark" -printf '%h\n' | sort -u)
+  sanitize_tree_for_plex "$final_stage"
+  mapfile -t dirs < <(find "$final_stage" -type f -name '*.flac' -printf '%h\n' | sort -u)
 
-  local partial_rip="no"
-  if rip_log_has_failed_tracks "$run_log"; then
-    partial_rip="yes"
-    print_partial_rip_summary "$stage_out" "$run_log"
+  if rip_log_has_failed_tracks "$final_log"; then
+    print_partial_rip_summary "$final_stage" "$final_log"
+    write_partial_rip_marker "$final_stage" "$final_log"
   fi
 
-  # Post-process: pad track numbers (optional)
   echo "Post-processing staged rip..."
-  if [[ "$PAD_TRACK_NUMBERS" == "yes" ]]; then
-    if ((${#dirs[@]}>0)); then
-      pad_tracks_in_dirs "${dirs[@]}"
-    fi
+  if [[ "$PAD_TRACK_NUMBERS" == "yes" && ${#dirs[@]} -gt 0 ]]; then
+    pad_tracks_in_dirs "${dirs[@]}"
   fi
-
   if [[ "$COVER_MODE" == "embed" || "$COVER_MODE" == "complete" ]]; then
     postprocess_cover_art "${dirs[@]}"
   fi
 
   echo "Publishing staged rip into library..."
-  if publish_staged_output "$stage_out" "$OUT_ROOT"; then
-    rm -rf -- "$stage_out"
-    stage_out=""
+  if publish_staged_output "$final_stage" "$OUT_ROOT"; then
+    final_status="published"
+    echo
+    if rip_log_has_failed_tracks "$final_log"; then
+      echo "⚠ Warning: Done, but this is a PARTIAL album. Re-rip this CD later to replace/complete missing tracks."
+    else
+      echo "✔ Done."
+    fi
+    eject_after_session "Rip"
   else
-    stage_out=""
+    final_status="kept staged - publish blocked"
+    kept_paths="$final_stage"
+    echo "   No cleanup touched your music directory."
+  fi
+
+  print_session_summary "$start_time" "$final_status" "$RELEASE_ID" "$release_modes" "$final_stage" "$final_log" "$retry_outcome" "$kept_paths"
+  echo "Tip: disc artefacts (.log/.cue/.m3u) are stored under each album's: .whipper/"
+
+  [[ "$final_status" == published ]] || return 1
+  return 0
+}
+
+repair_staged_partial() {
+  ensure_deps || return 1
+  mkdir -p "$OUT_ROOT"
+
+  local stage yn start_time dirs=() status kept_paths=""
+  SESSION_PUBLISHED_FILES=0
+  SESSION_CONFLICTS=0
+  start_time="$(date +%s)"
+
+  echo
+  read -rp "Path to staged partial rip directory: " stage
+  if [[ -z "${stage:-}" ]]; then
+    echo "No staging path entered."
+    return 1
+  fi
+  if [[ ! -d "$stage" ]]; then
+    echo "✘ Fail: Not a directory - $stage"
+    return 1
+  fi
+  if [[ "$stage" != /tmp/whipper-out-* ]]; then
+    echo "⚠ Warning:  This is not a usual wizard staging path:"
+    echo "  $stage"
+    read -rp "Continue anyway? [y/N] " yn
+    if ! is_yes "${yn:-}"; then
+      return 1
+    fi
+  fi
+  if ! find "$stage" -type f \( -name '*.flac' -o -path '*/.whipper/*' \) -print -quit | grep -q .; then
+    echo "✘ Fail: Staging path does not contain FLACs or .whipper artefacts."
+    return 1
+  fi
+  if ! find "$stage" -mindepth 3 -type f -name '*.flac' -print -quit | grep -q .; then
+    echo "✘ Fail: Staging path does not look like Artist/Album/track files."
     return 1
   fi
 
-  eject_after_session "Rip"
+  echo "Sanitizing staged paths for Plex/exFAT..."
+  sanitize_tree_for_plex "$stage"
+  mapfile -t dirs < <(find "$stage" -type f -name '*.flac' -printf '%h\n' | sort -u)
 
-  echo
-  if [[ "$partial_rip" == "yes" ]]; then
-    echo "⚠ Warning: Done, but this is a PARTIAL album. Re-rip this CD later to replace/complete missing tracks."
-  else
-    echo "✔ Done."
+  echo "Post-processing staged rip..."
+  if [[ "$PAD_TRACK_NUMBERS" == "yes" && ${#dirs[@]} -gt 0 ]]; then
+    pad_tracks_in_dirs "${dirs[@]}"
   fi
-  echo "Tip: disc artefacts (.log/.cue/.m3u) are stored under each album's: .whipper/"
+  if [[ "$COVER_MODE" == "embed" || "$COVER_MODE" == "complete" ]]; then
+    postprocess_cover_art "${dirs[@]}"
+  fi
+
+  echo "Repairing library additively..."
+  if publish_staged_output "$stage" "$OUT_ROOT"; then
+    status="repair completed"
+    echo "✔ Repair/merge completed without overwriting existing files."
+  else
+    status="repair blocked"
+    kept_paths="$stage"
+    echo "   No cleanup touched your music directory."
+  fi
+
+  print_session_summary "$start_time" "$status" "<manual repair>" "manual repair" "$stage" /dev/null "none" "$kept_paths"
+  [[ "$status" == "repair completed" ]] || return 1
 }
 
 main_menu() {
@@ -1235,9 +1705,11 @@ main_menu() {
   echo "3) Drive setup (analyze + offset)"
   echo "4) Edit ripping preferences"
   echo "5) Rip a CD now"
-  echo "6) Quit"
+  echo "6) Rip a CD in damaged disc mode"
+  echo "7) Repair/merge a staged partial rip"
+  echo "8) Quit"
   echo
-  read -rp "Choose [1-6]: " choice
+  read -rp "Choose [1-8]: " choice
   choice="${choice//[[:space:]]/}"
   case "$choice" in
     1) ensure_deps || rc=$? ;;
@@ -1245,7 +1717,9 @@ main_menu() {
     3) drive_setup || rc=$? ;;
     4) edit_prefs || rc=$? ;;
     5) rip_cd || rc=$? ;;
-    6) exit 0 ;;
+    6) rip_cd yes || rc=$? ;;
+    7) repair_staged_partial || rc=$? ;;
+    8) exit 0 ;;
     *) echo "Invalid choice." ;;
   esac
 

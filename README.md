@@ -18,6 +18,9 @@ It helps with:
 - safe AccurateRip offset detection for Whipper 0.10.0
 - numbered MusicBrainz release selection
 - keep-going ripping so one failed track does not discard the rest of the album
+- damaged disc mode for quick salvage attempts with fewer retries per track
+- merged recovery when normal and damaged attempts salvage different tracks
+- additive repair of existing partial albums without overwriting existing tracks
 - Plex/exFAT-safe path sanitising before publishing
 - FLAC ripping with MusicBrainz metadata
 - embedded and saved cover art
@@ -72,7 +75,11 @@ You do not need to repeat drive setup every time. Whipper saves the drive offset
 
 The wizard stages each rip in `/tmp` first. Before publishing, it renames staged paths to avoid characters that commonly break exFAT/Windows-compatible drives, such as `:`, `?`, `*`, `"`, `<`, `>`, `\`, and `|`. After that, it copies the staged files into your music library only if doing so will not overwrite existing files.
 
-If one or more tracks fail but other tracks were ripped, the wizard publishes a clearly labelled partial album, prints a completed/failed summary, and writes `.whipper/PARTIAL_RIP.txt`. This preserves useful work while making it obvious that the album still needs attention.
+If one or more tracks fail but other tracks were ripped, the wizard publishes a clearly labelled partial album, prints a completed/failed summary, and writes `.whipper/PARTIAL_RIP.txt`. This preserves useful work while making it obvious that the album still needs attention. Every rip or repair ends with a terminal session summary covering elapsed time, mode, completed tracks, failed or suspect tracks, AccurateRip counts, published files, conflicts, and any kept staging path.
+
+Damaged disc mode is available from the main menu. It keeps the same Whipper metadata, release selection, staging, cover-art, and publishing flow, but uses fewer retries per track so an obviously bad disc does not stall for ages. If a normal rip gives up on a track and readable FLACs were staged, the wizard can offer one automatic damaged-mode retry before publishing the partial album. Normal and damaged attempts are kept until publishing, then merged so the best available track from either attempt is used.
+
+If publishing finds an existing album marked with `.whipper/PARTIAL_RIP.txt`, the wizard treats it as a repair candidate. It adds missing FLACs and preserves new `.whipper` artefacts with attempt-specific names, but it never overwrites existing tracks automatically. If the existing album is not marked partial, publishing stops and the staged rip is kept for manual review.
 
 It does not delete user music files. Temporary Whipper work directories are removed after successful or failed runs.
 
@@ -100,7 +107,11 @@ Some external drives do not support Whipper's tray-close command. This warning i
 
 ### `cdparanoia couldn't read any frames`
 
-If Whipper retries a track several times and then gives up, the wizard keeps going where possible. If any FLACs were successfully created, it publishes a clearly labelled partial album and prints a summary of completed and failed tracks. Try cleaning the disc and ripping again. If the same track fails repeatedly, inspect the disc or try another drive.
+If Whipper retries a track several times and then gives up, it may print a `ZeroDivisionError` traceback. It can also crash while writing its final log with a `NoneType` division error after unreadable tracks. The wizard does not hide this Whipper output, but it treats these as known damaged-disc failure modes and keeps going where possible. If any FLACs were successfully created, it can retry once in damaged disc mode, merge the best tracks from each attempt, or publish/repair a clearly labelled partial album.
+
+### Very high Q sub-channel CRC errors
+
+Some damaged discs report very high Q sub-channel CRC error counts before audio ripping begins. If a track reports at least 1000 such errors, or the running total reaches 5000, the wizard warns and asks whether to stop the normal attempt and restart in damaged disc mode.
 
 ## Roadmap
 
