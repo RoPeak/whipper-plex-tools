@@ -29,6 +29,13 @@ COVER_NAMES = {
     "folder.png",
 }
 USER_AGENT = "whipper-music-wizard/1.0 (https://musicbrainz.org/doc/XML_Web_Service/Rate_Limiting)"
+STATUS_DELAY = 0.0
+
+
+def status(message: str) -> None:
+    print(message, flush=True)
+    if STATUS_DELAY > 0:
+        time.sleep(STATUS_DELAY)
 
 
 @dataclass
@@ -74,7 +81,8 @@ def sanitize_component(name: str) -> str:
         '"': "",
         "<": "(",
         ">": ")",
-        "\\": " -",
+        "\\": " - ",
+        "/": " - ",
         "|": " -",
         "\r": " ",
         "\n": " ",
@@ -187,9 +195,12 @@ def track_from_probe(source: Path, root: Path, probe: dict[str, Any]) -> Track:
 
 def scan_source(root: Path) -> list[Track]:
     tracks: list[Track] = []
-    for path in sorted(root.rglob("*")):
-        if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS:
-            tracks.append(track_from_probe(path, root, ffprobe_json(path)))
+    paths = [path for path in sorted(root.rglob("*")) if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS]
+    status(f"Scanning {len(paths)} supported audio file(s) with ffprobe...")
+    for index, path in enumerate(paths, 1):
+        if index == 1 or index % 10 == 0 or index == len(paths):
+            status(f"  ffprobe metadata: {index}/{len(paths)}")
+        tracks.append(track_from_probe(path, root, ffprobe_json(path)))
     return tracks
 
 
@@ -229,10 +240,13 @@ def musicbrainz_json(url: str) -> dict[str, Any]:
 
 def enrich_with_musicbrainz(groups: list[AlbumGroup]) -> None:
     last_request = 0.0
-    for group in groups:
+    status(f"Searching MusicBrainz for {len(groups)} album group(s)...")
+    for index, group in enumerate(groups, 1):
         if group.musicbrainz_releaseid or group.album in {"", "Unknown Album"}:
             group.match_status = "embedded release id" if group.musicbrainz_releaseid else "not enough metadata"
+            status(f"  MusicBrainz {index}/{len(groups)}: {group.album_artist} - {group.album}: {group.match_status}")
             continue
+        status(f"  MusicBrainz {index}/{len(groups)}: {group.album_artist} - {group.album}")
         query_bits = [f'release:"{group.album}"']
         if group.album_artist and group.album_artist != "Unknown Artist":
             query_bits.append(f'artist:"{group.album_artist}"')
@@ -248,19 +262,23 @@ def enrich_with_musicbrainz(groups: list[AlbumGroup]) -> None:
             last_request = time.monotonic()
         except Exception as exc:
             group.match_status = f"lookup failed: {exc}"
+            status(f"    {group.match_status}")
             continue
         releases = data.get("releases", []) or []
         if not releases:
             group.match_status = "no MusicBrainz match"
+            status("    no MusicBrainz match")
             continue
         best = max(releases, key=lambda r: release_score(group, r))
         score = release_score(group, best)
         if score < 4:
             group.match_status = "weak MusicBrainz match ignored"
+            status("    weak MusicBrainz match ignored")
             continue
         group.musicbrainz_releaseid = str(best.get("id") or "")
         group.year = group.year or parse_year(str(best.get("date") or ""))
         group.match_status = f"MusicBrainz candidate: {group.musicbrainz_releaseid}"
+        status(f"    {group.match_status}")
 
 
 def release_score(group: AlbumGroup, release: dict[str, Any]) -> int:
@@ -288,6 +306,7 @@ def proposed_album_dir(group: AlbumGroup) -> str:
 def assign_destinations(groups: list[AlbumGroup], multidisc: bool, include_track_artist: bool) -> None:
     for group in groups:
         used: set[str] = set()
+        use_disc_prefix = group_has_multiple_discs(group) and not multidisc
         for index, track in enumerate(group.tracks, 1):
             track.artist = track.artist or group.artist
             track.album_artist = group.album_artist
@@ -299,10 +318,13 @@ def assign_destinations(groups: list[AlbumGroup], multidisc: bool, include_track
             if multidisc and (track.disc > 1 or group_has_multiple_discs(group)):
                 parts.append(f"CD{track.disc or 1}")
             title = sanitize_component(track.title or f"Track {track.track}")
+            track_prefix = f"{track.track:02d}"
+            if use_disc_prefix:
+                track_prefix = f"{track.disc or 1}-{track.track:02d}"
             if include_track_artist and track.artist:
-                filename = f"{track.track:02d} - {sanitize_component(track.artist)} - {title}{track.extension}"
+                filename = f"{track_prefix} - {sanitize_component(track.artist)} - {title}{track.extension}"
             else:
-                filename = f"{track.track:02d} - {title}{track.extension}"
+                filename = f"{track_prefix} - {title}{track.extension}"
             rel = os.path.join(*parts, filename)
             rel = uniquify_rel(rel, used)
             used.add(rel)
@@ -424,7 +446,9 @@ def stage_import(groups: list[AlbumGroup], stage: Path, source_root: Path, multi
     for group in groups:
         if group.skip:
             skipped += len(group.tracks)
+            status(f"Skipping album: {group.album_artist} - {group.album}")
             continue
+        status(f"Staging album: {group.album_artist} - {group.album} ({len(group.tracks)} track(s))")
         album_dir = stage / proposed_album_dir(group)
         artifact_dir = album_dir / ".library-import"
         artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -477,6 +501,8 @@ def copy_album_cover(source_root: Path, group: AlbumGroup, album_dir: Path, arti
 
 
 def cmd_import(args: argparse.Namespace) -> int:
+    global STATUS_DELAY
+    STATUS_DELAY = args.delay
     source = Path(args.source).expanduser().resolve()
     stage = Path(args.stage).expanduser().resolve()
     library_root = Path(args.library_root).expanduser()
@@ -493,6 +519,7 @@ def cmd_import(args: argparse.Namespace) -> int:
         for rel in unreadable:
             print(f"  {rel}")
     groups = group_tracks(tracks)
+    status(f"Grouped files into {len(groups)} album candidate(s).")
     if args.lookup == "yes":
         enrich_with_musicbrainz(groups)
     if not interactive_review(groups, library_root, args.multidisc == "yes", args.include_track_artist == "yes"):
@@ -516,6 +543,7 @@ def build_parser() -> argparse.ArgumentParser:
     importer.add_argument("--multidisc", choices=["yes", "no"], default="no")
     importer.add_argument("--include-track-artist", choices=["yes", "no"], default="no")
     importer.add_argument("--lookup", choices=["yes", "no"], default="yes")
+    importer.add_argument("--delay", type=float, default=0.0)
     importer.add_argument("--result-file", required=True)
     importer.set_defaults(func=cmd_import)
     return parser

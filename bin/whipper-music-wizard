@@ -27,6 +27,7 @@ EJECT_AFTER="${EJECT_AFTER:-no}"        # yes/no
 EJECT_TIMEOUT_SECONDS=15
 BAD_DISC_TRACK_Q_THRESHOLD=1000
 BAD_DISC_TOTAL_Q_THRESHOLD=5000
+WIZARD_STEP_DELAY="${WIZARD_STEP_DELAY:-0.35}"
 
 # Whipper 0.10.0/cdparanoia can crash while trying some high offsets.
 # Keep automatic search to common offsets with absolute values <= 587.
@@ -89,6 +90,17 @@ is_no() {
 
 is_nonneg_int() {
   [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+gentle_pause() {
+  [[ -t 1 ]] || return 0
+  [[ "${WIZARD_STEP_DELAY:-0}" == "0" || "${WIZARD_STEP_DELAY:-0}" == "0.0" ]] && return 0
+  sleep "$WIZARD_STEP_DELAY" 2>/dev/null || true
+}
+
+say_status() {
+  echo "$@"
+  gentle_pause
 }
 
 coerce_yes_no() {
@@ -363,7 +375,7 @@ ensure_deps() {
   fi
 
   if ((${#missing[@]}==0)); then
-    echo "✔ Success: Dependencies look OK."
+    say_status "✔ Success: Dependencies look OK."
     return 0
   fi
 
@@ -393,7 +405,7 @@ ensure_digital_import_deps() {
   fi
 
   if ((${#missing[@]}==0)); then
-    echo "✔ Success: Digital import dependencies look OK."
+    say_status "✔ Success: Digital import dependencies look OK."
     return 0
   fi
 
@@ -463,7 +475,7 @@ pick_device() {
     echo "   Avoid running the wizard with sudo unless you intentionally want root-owned config/output."
   fi
 
-  echo "✔ Success: Using device - $DEVICE"
+  say_status "✔ Success: Using device - $DEVICE"
   save_cfg
 }
 
@@ -570,7 +582,7 @@ edit_prefs() {
 
   mkdir -p "$OUT_ROOT"
   save_cfg
-  echo "✔ Saved."
+  say_status "✔ Saved."
 }
 
 drive_setup() {
@@ -594,7 +606,7 @@ drive_setup() {
       echo "Insert a relatively common CD, then press ENTER."
       read -r
       if whipper drive analyze -d "$DEVICE"; then
-        echo "✔ Done."
+        say_status "✔ Done."
       else
         echo "✘ Fail: Drive analysis failed."
         echo "   Check the disc is inserted, the device is correct, and your user can read $DEVICE."
@@ -615,7 +627,7 @@ drive_setup() {
       offset_log="$(mktemp -t whipper-offset-XXXXXX.log)"
       if run_logged "$offset_log" whipper offset find -d "$DEVICE" -o "$SAFE_OFFSET_SEARCH" && offset_find_confirmed "$offset_log"; then
         rm -f -- "$offset_log"
-        echo "✔ Done (confirmed offsets are saved into whipper.conf automatically)."
+        say_status "✔ Done (confirmed offsets are saved into whipper.conf automatically)."
       else
         rm -f -- "$offset_log"
         echo "✘ Fail: Offset detection failed."
@@ -642,7 +654,7 @@ drive_setup() {
       offset_log="$(mktemp -t whipper-offset-XXXXXX.log)"
       if run_logged "$offset_log" whipper offset find -d "$DEVICE" -o "$off" && offset_find_confirmed "$offset_log"; then
         rm -f -- "$offset_log"
-        echo "✔ Done (confirmed offsets are saved into whipper.conf automatically)."
+        say_status "✔ Done (confirmed offsets are saved into whipper.conf automatically)."
       else
         rm -f -- "$offset_log"
         echo "✘ Fail: Offset verification failed for $off"
@@ -1232,6 +1244,76 @@ publish_staged_output() {
   return 0
 }
 
+files_match_for_import() {
+  local src="$1"
+  local target="$2"
+
+  [[ -f "$src" && -f "$target" ]] || return 1
+  [[ "$(stat -c '%s' "$src")" == "$(stat -c '%s' "$target")" ]] || return 1
+  cmp -s -- "$src" "$target"
+}
+
+publish_digital_import_output() {
+  local stage="$1"
+  local dest="$2"
+  local src rel target copied=0 skipped=0 differing=0
+  local files=()
+  local conflicts=()
+
+  mapfile -t files < <(find "$stage" -type f | sort)
+  if ((${#files[@]} == 0)); then
+    echo "✘ Fail: No files were created in the staging directory."
+    echo "   Staging directory kept for inspection: $stage"
+    return 1
+  fi
+
+  say_status "Checking ${#files[@]} staged file(s) against the library..."
+  for src in "${files[@]}"; do
+    rel="${src#"$stage"/}"
+    target="$dest/$rel"
+    if [[ -e "$target" ]]; then
+      if [[ "$rel" == */.library-import/* ]] || files_match_for_import "$src" "$target"; then
+        ((skipped += 1))
+        continue
+      fi
+      conflicts+=("$rel")
+      ((differing += 1))
+    fi
+  done
+
+  if ((${#conflicts[@]} > 0)); then
+    echo
+    echo "✘ Fail: Not copying this digital import because these existing files differ:"
+    printf '  %s\n' "${conflicts[@]}"
+    echo
+    echo "Matching files were safe to skip, but differing files need review first."
+    echo "Staged output kept here:"
+    echo "  $stage"
+    SESSION_CONFLICTS=$((SESSION_CONFLICTS + differing + skipped))
+    return 1
+  fi
+
+  say_status "Copying new files into the library..."
+  for src in "${files[@]}"; do
+    rel="${src#"$stage"/}"
+    target="$dest/$rel"
+    if [[ -e "$target" ]]; then
+      continue
+    fi
+    mkdir -p "$(dirname "$target")"
+    cp -p -- "$src" "$target"
+    ((copied += 1))
+  done
+
+  SESSION_PUBLISHED_FILES=$((SESSION_PUBLISHED_FILES + copied))
+  SESSION_CONFLICTS=$((SESSION_CONFLICTS + skipped))
+  echo "Published digital import into library: $dest"
+  if ((skipped > 0)); then
+    echo "Skipped $skipped already-imported matching file(s)."
+  fi
+  return 0
+}
+
 list_staged_flacs() {
   local stage="$1"
   find "$stage" -type f -name '*.flac' | sort
@@ -1716,15 +1798,18 @@ import_digital_music() {
   trap 'cleanup_import_tmp; trap - RETURN' RETURN
 
   echo
+  say_status "Starting digital import."
   echo "Importing digital music with:"
   echo "  Source:      $source"
   echo "  Output root: $OUT_ROOT"
   echo "  Mode:        copy originals, preserve source formats"
   echo "  Lookup:      local tags + filename/folder inference + MusicBrainz search"
+  echo "  Status pace: ${WIZARD_STEP_DELAY}s between major steps (set WIZARD_STEP_DELAY=0 to disable)"
   echo
   echo "Note: MP3/M4A files will not be converted to FLAC; transcoding lossy files only makes larger files."
   echo
 
+  say_status "Scanning source and preparing metadata review..."
   if ! python3 "$IMPORT_HELPER" import \
     --source "$source" \
     --stage "$stage" \
@@ -1732,6 +1817,7 @@ import_digital_music() {
     --multidisc "$MULTIDISC" \
     --include-track-artist "$INCLUDE_TRACK_ARTIST" \
     --lookup yes \
+    --delay "$WIZARD_STEP_DELAY" \
     --result-file "$result"; then
     status="digital import aborted"
     echo "Digital import did not publish anything."
@@ -1744,16 +1830,17 @@ import_digital_music() {
     return 1
   fi
 
-  echo "Sanitizing staged paths for media-server/exFAT..."
+  say_status "Sanitizing staged paths for media-server/exFAT..."
   sanitize_tree_for_media_library "$stage"
   mapfile -t dirs < <(find "$stage" -type f -name '*.flac' -printf '%h\n' | sort -u)
 
   if [[ "$COVER_MODE" == "embed" || "$COVER_MODE" == "complete" ]]; then
+    say_status "Checking FLAC cover-art post-processing..."
     postprocess_cover_art "${dirs[@]}"
   fi
 
-  echo "Publishing staged digital import into library..."
-  if publish_staged_output "$stage" "$OUT_ROOT"; then
+  say_status "Publishing staged digital import into library..."
+  if publish_digital_import_output "$stage" "$OUT_ROOT"; then
     status="digital import published"
     echo "✔ Digital import complete. Original source files were left untouched."
   else

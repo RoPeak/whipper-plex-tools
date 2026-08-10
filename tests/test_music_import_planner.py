@@ -70,6 +70,31 @@ class MusicImportPlannerTests(unittest.TestCase):
 
     def test_unsafe_characters_are_sanitized(self):
         self.assertEqual(sanitize_component('Bad: Name? * " <x>|'), "Bad - Name (x) -")
+        self.assertEqual(sanitize_component("Either/Or"), "Either - Or")
+
+    def test_multidisc_without_cd_folders_uses_disc_track_prefix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "Elliott Smith"
+            paths = [
+                root / "New Moon" / "1-01 Angel In The Snow.mp3",
+                root / "New Moon" / "2-01 Georgia, Georgia.mp3",
+            ]
+            for path in paths:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"audio")
+            tracks = [track_from_probe(path, root, probe({})) for path in paths]
+            groups = group_tracks(tracks)
+            groups[0].year = "2006"
+            assign_destinations(groups, multidisc=False, include_track_artist=False)
+
+            self.assertEqual(
+                tracks[0].proposed_rel,
+                "Elliott Smith/New Moon (2006)/1-01 - Angel In The Snow.mp3",
+            )
+            self.assertEqual(
+                tracks[1].proposed_rel,
+                "Elliott Smith/New Moon (2006)/2-01 - Georgia, Georgia.mp3",
+            )
 
     def test_duplicate_destinations_are_disambiguated(self):
         with tempfile.TemporaryDirectory() as tmp:

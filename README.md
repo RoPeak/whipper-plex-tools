@@ -91,6 +91,12 @@ For existing digital music, choose `Import existing digital music directory`, po
 
 MP3 and M4A files are preserved as MP3 and M4A. Converting lossy files to FLAC is technically possible, but it does not restore quality and usually only makes the files larger.
 
+The wizard prints progress while scanning files, looking up album metadata, staging output, and publishing. It also uses a small delay between major status messages so interactive runs are readable. Set `WIZARD_STEP_DELAY=0` for fast scripted runs:
+
+```bash
+WIZARD_STEP_DELAY=0 ./bin/whipper-music-wizard
+```
+
 ## Safety Notes
 
 The wizard stages each rip or digital import in `/tmp` first. Before publishing, it renames staged paths to avoid characters that commonly break exFAT/Windows-compatible drives, such as `:`, `?`, `*`, `"`, `<`, `>`, `\`, and `|`. After that, it copies the staged files into your music library only if doing so will not overwrite existing files.
@@ -98,6 +104,8 @@ The wizard stages each rip or digital import in `/tmp` first. Before publishing,
 If one or more CD tracks fail but other tracks were ripped, the wizard publishes a clearly labelled partial album, prints a completed/failed summary, and writes `.whipper/PARTIAL_RIP.txt`. This preserves useful work while making it obvious that the album still needs attention. Every rip or repair ends with a terminal session summary covering elapsed time, mode, completed tracks, failed or suspect tracks, AccurateRip counts, published files, conflicts, and any kept staging path.
 
 Digital imports use `ffprobe` readability, embedded tags, filename/folder inference, MusicBrainz search, and your confirmation as their verification flow. They do not have AccurateRip verification because they are not being read from the original CD.
+
+Digital imports are safe to rerun. Existing files with identical bytes are treated as already imported and skipped. If a destination file exists but differs, publishing stops and keeps the staged output for review.
 
 Damaged disc mode is available from the main menu. It keeps the same Whipper metadata, release selection, staging, cover-art, and publishing flow, but uses fewer retries per track so an obviously bad disc does not stall for ages. If a normal rip gives up on a track and readable FLACs were staged, the wizard can offer one automatic damaged-mode retry before publishing the partial album. Normal and damaged attempts are kept until publishing, then merged so the best available track from either attempt is used.
 
