@@ -70,6 +70,7 @@ class AlbumGroup:
     album: str = ""
     year: str = ""
     musicbrainz_releaseid: str = ""
+    musicbrainz_releasegroupid: str = ""
     match_status: str = "not searched"
     skip: bool = False
 
@@ -256,35 +257,20 @@ def enrich_with_musicbrainz(groups: list[AlbumGroup]) -> None:
             status(f"  MusicBrainz {index}/{len(groups)}: {group.album_artist} - {group.album}: {group.match_status}")
             continue
         status(f"  MusicBrainz {index}/{len(groups)}: {group.album_artist} - {group.album}")
-        query_bits = [f'release:"{group.album}"']
-        if group.album_artist and group.album_artist != "Unknown Artist":
-            query_bits.append(f'artist:"{group.album_artist}"')
-        if group.year:
-            query_bits.append(f"date:{group.year}")
-        query = " AND ".join(query_bits)
-        url = "https://musicbrainz.org/ws/2/release/?" + urllib.parse.urlencode({"query": query, "fmt": "json", "limit": "5"})
-        try:
-            last_request = wait_for_musicbrainz(last_request)
-            data = musicbrainz_json(url)
-        except Exception as exc:
-            group.match_status = f"lookup failed: {exc}"
-            status(f"    {group.match_status}")
-            continue
-        releases = data.get("releases", []) or []
-        if not releases:
-            group.match_status = "no MusicBrainz match"
-            status("    no MusicBrainz match")
-            continue
-        best = max(releases, key=lambda r: release_score(group, r))
-        score = release_score(group, best)
-        if score < 4:
-            group.match_status = "weak MusicBrainz match ignored"
-            status("    weak MusicBrainz match ignored")
-            continue
-        group.musicbrainz_releaseid = str(best.get("id") or "")
-        group.year = group.year or parse_year(str(best.get("date") or ""))
-        group.match_status = f"MusicBrainz candidate: {group.musicbrainz_releaseid}"
+        release_id, release_group_id_value, match_status, last_request = find_musicbrainz_release(group.album_artist, group.album, group.year, last_request)
+        group.match_status = match_status
+        if release_id:
+            group.musicbrainz_releaseid = release_id
+            group.musicbrainz_releasegroupid = release_group_id_value
+            group.match_status = f"{match_status}: {group.musicbrainz_releaseid}"
         status(f"    {group.match_status}")
+
+
+def release_group_id(release: dict[str, Any]) -> str:
+    release_group = release.get("release-group") or release.get("release_group") or {}
+    if isinstance(release_group, dict):
+        return str(release_group.get("id") or "")
+    return ""
 
 
 def release_score(group: AlbumGroup, release: dict[str, Any]) -> int:
@@ -476,6 +462,7 @@ def stage_import(groups: list[AlbumGroup], stage: Path, source_root: Path, multi
                 "album": group.album,
                 "year": group.year,
                 "musicbrainz_releaseid": group.musicbrainz_releaseid,
+                "musicbrainz_releasegroupid": group.musicbrainz_releasegroupid,
                 "match_status": group.match_status,
                 "tracks": album_tracks,
             }
@@ -554,50 +541,92 @@ def album_info_from_dir(album_dir: Path, library_root: Path) -> dict[str, str]:
                 "album": str(data.get("album") or parse_album_folder_name(album_dir.name)[0]),
                 "year": str(data.get("year") or parse_album_folder_name(album_dir.name)[1]),
                 "musicbrainz_releaseid": str(data.get("musicbrainz_releaseid") or ""),
+                "musicbrainz_releasegroupid": str(data.get("musicbrainz_releasegroupid") or ""),
             }
         except (OSError, json.JSONDecodeError):
             pass
     album, year = parse_album_folder_name(album_dir.name)
     artist = album_dir.parent.name if album_dir.parent != library_root else "Unknown Artist"
-    return {"album_artist": artist, "album": album, "year": year, "musicbrainz_releaseid": ""}
+    return {"album_artist": artist, "album": album, "year": year, "musicbrainz_releaseid": "", "musicbrainz_releasegroupid": ""}
 
 
-def find_musicbrainz_release_id(album_artist: str, album: str, year: str, last_request: float) -> tuple[str, str, float]:
+def find_musicbrainz_release(album_artist: str, album: str, year: str, last_request: float) -> tuple[str, str, str, float]:
     if not album or album == "Unknown Album":
-        return "", "not enough metadata", last_request
-    query_bits = [f'release:"{album}"']
-    if album_artist and album_artist != "Unknown Artist":
-        query_bits.append(f'artist:"{album_artist}"')
+        return "", "", "not enough metadata", last_request
+
+    attempts = [year]
     if year:
-        query_bits.append(f"date:{year}")
-    query = " AND ".join(query_bits)
-    url = "https://musicbrainz.org/ws/2/release/?" + urllib.parse.urlencode({"query": query, "fmt": "json", "limit": "5"})
-    try:
-        last_request = wait_for_musicbrainz(last_request)
-        data = musicbrainz_json(url)
-    except Exception as exc:
-        return "", f"lookup failed: {exc}", last_request
-    group = AlbumGroup(key="", album_artist=album_artist, album=album, year=year)
-    releases = data.get("releases", []) or []
-    if not releases:
-        return "", "no MusicBrainz match", last_request
-    best = max(releases, key=lambda r: release_score(group, r))
-    if release_score(group, best) < 4:
-        return "", "weak MusicBrainz match ignored", last_request
-    return str(best.get("id") or ""), "MusicBrainz candidate", last_request
+        attempts.append("")
+    last_status = "no MusicBrainz match"
+    for attempt_year in attempts:
+        query_bits = [f'release:"{album}"']
+        if album_artist and album_artist != "Unknown Artist":
+            query_bits.append(f'artist:"{album_artist}"')
+        if attempt_year:
+            query_bits.append(f"date:{attempt_year}")
+        query = " AND ".join(query_bits)
+        url = "https://musicbrainz.org/ws/2/release/?" + urllib.parse.urlencode({"query": query, "fmt": "json", "limit": "10"})
+        try:
+            last_request = wait_for_musicbrainz(last_request)
+            data = musicbrainz_json(url)
+        except Exception as exc:
+            return "", "", f"lookup failed: {exc}", last_request
+        group = AlbumGroup(key="", album_artist=album_artist, album=album, year=attempt_year)
+        releases = data.get("releases", []) or []
+        if not releases:
+            last_status = "no MusicBrainz match"
+            continue
+        best = max(releases, key=lambda r: release_score(group, r))
+        if release_score(group, best) < 4:
+            last_status = "weak MusicBrainz match ignored"
+            continue
+        status_text = "MusicBrainz candidate"
+        if year and not attempt_year:
+            status_text = "MusicBrainz candidate after retry without folder year"
+        return str(best.get("id") or ""), release_group_id(best), status_text, last_request
+    return "", "", last_status, last_request
 
 
-def download_cover_jpg(release_id: str, target: Path) -> str:
-    url = f"https://coverartarchive.org/release/{release_id}/front-500"
+def release_group_id_for_release(release_id: str, last_request: float) -> tuple[str, float]:
+    url = f"https://musicbrainz.org/ws/2/release/{urllib.parse.quote(release_id)}?" + urllib.parse.urlencode({"inc": "release-groups", "fmt": "json"})
+    last_request = wait_for_musicbrainz(last_request)
+    data = musicbrainz_json(url)
+    return release_group_id(data), last_request
+
+
+def coverart_bytes(entity: str, entity_id: str) -> bytes:
+    url = f"https://coverartarchive.org/{entity}/{entity_id}/front-500"
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    tmp = target.with_suffix(".jpg.tmp")
     with urllib.request.urlopen(request, timeout=20) as response:
-        content = response.read()
+        return response.read()
+
+
+def download_cover_jpg(release_id: str, release_group_id_value: str, target: Path, last_request: float) -> tuple[str, float]:
+    tmp = target.with_suffix(".jpg.tmp")
+    errors: list[str] = []
+    content = b""
+    if release_id:
+        try:
+            content = coverart_bytes("release", release_id)
+        except Exception as exc:
+            errors.append(f"release cover: {exc}")
+    if not content and not release_group_id_value and release_id:
+        try:
+            release_group_id_value, last_request = release_group_id_for_release(release_id, last_request)
+        except Exception as exc:
+            errors.append(f"release-group lookup: {exc}")
+    if not content and release_group_id_value:
+        try:
+            content = coverart_bytes("release-group", release_group_id_value)
+        except Exception as exc:
+            errors.append(f"release-group cover: {exc}")
     if not content:
-        return "empty cover response"
+        return "; ".join(errors) if errors else "empty cover response", last_request
     tmp.write_bytes(content)
     tmp.replace(target)
-    return "downloaded"
+    if release_group_id_value and errors:
+        return "downloaded from release group", last_request
+    return "downloaded", last_request
 
 
 def cmd_covers(args: argparse.Namespace) -> int:
@@ -612,6 +641,11 @@ def cmd_covers(args: argparse.Namespace) -> int:
     albums = discover_album_dirs(root)
     status(f"Scanning {root} for album folders...")
     status(f"Found {len(albums)} album folder(s).")
+    if not albums:
+        print()
+        print("No album folders were found. Check that the selected directory contains album folders with audio files.")
+        print("For an artist import, this is usually the artist directory, for example:")
+        print("  /home/ronan/Music/Elliott Smith")
     downloaded = 0
     skipped = 0
     failed = 0
@@ -627,16 +661,19 @@ def cmd_covers(args: argparse.Namespace) -> int:
             skipped += 1
             continue
         release_id = info["musicbrainz_releaseid"]
+        release_group_id_value = info["musicbrainz_releasegroupid"]
         if not release_id:
-            release_id, match_status, last_request = find_musicbrainz_release_id(info["album_artist"], info["album"], info["year"], last_request)
+            release_id, release_group_id_value, match_status, last_request = find_musicbrainz_release(info["album_artist"], info["album"], info["year"], last_request)
             if not release_id:
                 status(f"    {match_status}; no cover downloaded")
                 failed += 1
                 continue
         try:
-            result = download_cover_jpg(release_id, target)
+            result, last_request = download_cover_jpg(release_id, release_group_id_value, target, last_request)
         except Exception as exc:
-            status(f"    cover download failed: {exc}")
+            result = f"cover download failed: {exc}"
+        if result != "downloaded" and not result.startswith("downloaded"):
+            status(f"    cover download failed: {result}")
             failed += 1
             continue
         status(f"    saved {target.name} ({result})")

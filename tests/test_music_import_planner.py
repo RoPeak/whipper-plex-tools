@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
@@ -9,7 +10,9 @@ from lib.music_import_planner import (
     album_info_from_dir,
     assign_destinations,
     discover_album_dirs,
+    download_cover_jpg,
     edit_album,
+    find_musicbrainz_release,
     group_tracks,
     sanitize_component,
     stage_import,
@@ -177,6 +180,7 @@ class MusicImportPlannerTests(unittest.TestCase):
                         "album": "XO",
                         "year": "1998",
                         "musicbrainz_releaseid": "release-id",
+                        "musicbrainz_releasegroupid": "group-id",
                     }
                 ),
                 encoding="utf-8",
@@ -189,6 +193,7 @@ class MusicImportPlannerTests(unittest.TestCase):
                     "album": "XO",
                     "year": "1998",
                     "musicbrainz_releaseid": "release-id",
+                    "musicbrainz_releasegroupid": "group-id",
                 },
             )
 
@@ -201,6 +206,7 @@ class MusicImportPlannerTests(unittest.TestCase):
                     "album": "Figure 8",
                     "year": "2000",
                     "musicbrainz_releaseid": "",
+                    "musicbrainz_releasegroupid": "",
                 },
             )
 
@@ -221,6 +227,44 @@ class MusicImportPlannerTests(unittest.TestCase):
         self.assertEqual(group.year, "1995")
         self.assertEqual(group.musicbrainz_releaseid, "")
         self.assertEqual(group.match_status, "metadata edited; release lookup needed")
+
+    def test_find_musicbrainz_release_retries_without_bad_year(self):
+        responses = [
+            {"releases": []},
+            {
+                "releases": [
+                    {
+                        "id": "release-id",
+                        "title": "New Moon",
+                        "date": "2007",
+                        "artist-credit": [{"name": "Elliott Smith"}],
+                        "release-group": {"id": "group-id"},
+                    }
+                ]
+            },
+        ]
+
+        with patch("lib.music_import_planner.musicbrainz_json", side_effect=responses), patch("lib.music_import_planner.wait_for_musicbrainz", return_value=1.0):
+            release_id, group_id, status, _last_request = find_musicbrainz_release("Elliott Smith", "New Moon", "2006", 0.0)
+
+        self.assertEqual(release_id, "release-id")
+        self.assertEqual(group_id, "group-id")
+        self.assertEqual(status, "MusicBrainz candidate after retry without folder year")
+
+    def test_download_cover_falls_back_to_release_group(self):
+        target = Path(tempfile.mkdtemp()) / "cover.jpg"
+
+        def fake_coverart(entity, entity_id):
+            if entity == "release":
+                raise urllib.error.HTTPError("", 404, "NOT FOUND", {}, None)
+            self.assertEqual((entity, entity_id), ("release-group", "group-id"))
+            return b"jpg"
+
+        with patch("lib.music_import_planner.coverart_bytes", side_effect=fake_coverart):
+            result, _last_request = download_cover_jpg("release-id", "group-id", target, 0.0)
+
+        self.assertEqual(result, "downloaded from release group")
+        self.assertEqual(target.read_bytes(), b"jpg")
 
 
 if __name__ == "__main__":

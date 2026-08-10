@@ -135,9 +135,13 @@ The wizard shows numbered choices and then passes the selected MusicBrainz relea
 
 Use the import review to edit album or track metadata before accepting. The wizard reads embedded tags first, falls back to folder and filename patterns, and then searches MusicBrainz for likely release information. Messy downloads, bootlegs, singles folders, and unofficial compilations may still need human correction.
 
+Shell shortcuts such as `~/Downloads/...` are accepted in wizard path prompts. If a scan finds zero albums, double-check artist-name spelling in the path; for example `Elliot Smith` and `Elliott Smith` are different directories.
+
 ### Album covers are missing
 
 Run `Download missing album covers` from the main menu after importing. The job uses stored MusicBrainz release IDs from `.library-import/IMPORT_MANIFEST.json` when available, otherwise it searches MusicBrainz from the artist, album, and year inferred from the folder path. Cover Art Archive images are saved as album-level `cover.jpg` files.
+
+Some unofficial, soundtrack-only, or bootleg-style folders may not have a MusicBrainz/Cover Art Archive cover. When a folder year appears wrong, the cover job retries the search without that year before giving up.
 
 ### Cover art fetch crashes before ripping
 

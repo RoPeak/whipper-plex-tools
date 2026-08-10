@@ -103,6 +103,17 @@ say_status() {
   gentle_pause
 }
 
+expand_user_path() {
+  local path="$1"
+  if [[ "$path" == "~" ]]; then
+    printf '%s\n' "$HOME"
+  elif [[ "$path" == "~/"* ]]; then
+    printf '%s/%s\n' "$HOME" "${path#"~/"}"
+  else
+    printf '%s\n' "$path"
+  fi
+}
+
 coerce_yes_no() {
   local answer="$1"
   local default="$2"
@@ -434,7 +445,7 @@ choose_output_root_for_job() {
   echo "  Current: $OUT_ROOT"
   read -rp "Use a different library/output directory for this run? Enter path or press ENTER to keep: " v
   if [[ -n "${v:-}" ]]; then
-    OUT_ROOT="$v"
+    OUT_ROOT="$(expand_user_path "$v")"
     mkdir -p "$OUT_ROOT"
     save_cfg
     say_status "✔ Output directory saved: $OUT_ROOT"
@@ -1783,6 +1794,7 @@ import_digital_music() {
 
   echo
   read -rp "Path to digital music directory: " source
+  source="$(expand_user_path "$source")"
   if [[ -z "${source:-}" ]]; then
     echo "No source path entered."
     return 1
