@@ -2,3 +2,5 @@ tmp/
 docs/
 *.log
 Last-Whipper-Run-Output.txt
+__pycache__/
+*.py[cod]
