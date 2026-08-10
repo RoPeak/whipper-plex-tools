@@ -28,6 +28,8 @@ COVER_NAMES = {
     "folder.jpeg",
     "folder.png",
 }
+ARTIFACT_DIR_NAME = ".library-import"
+IMPORT_MANIFEST_NAME = "IMPORT_MANIFEST.json"
 USER_AGENT = "whipper-music-wizard/1.0 (https://musicbrainz.org/doc/XML_Web_Service/Rate_Limiting)"
 STATUS_DELAY = 0.0
 
@@ -238,6 +240,13 @@ def musicbrainz_json(url: str) -> dict[str, Any]:
         return json.loads(response.read().decode("utf-8"))
 
 
+def wait_for_musicbrainz(last_request: float) -> float:
+    wait = 1.05 - (time.monotonic() - last_request)
+    if wait > 0:
+        time.sleep(wait)
+    return time.monotonic()
+
+
 def enrich_with_musicbrainz(groups: list[AlbumGroup]) -> None:
     last_request = 0.0
     status(f"Searching MusicBrainz for {len(groups)} album group(s)...")
@@ -255,11 +264,8 @@ def enrich_with_musicbrainz(groups: list[AlbumGroup]) -> None:
         query = " AND ".join(query_bits)
         url = "https://musicbrainz.org/ws/2/release/?" + urllib.parse.urlencode({"query": query, "fmt": "json", "limit": "5"})
         try:
-            wait = 1.05 - (time.monotonic() - last_request)
-            if wait > 0:
-                time.sleep(wait)
+            last_request = wait_for_musicbrainz(last_request)
             data = musicbrainz_json(url)
-            last_request = time.monotonic()
         except Exception as exc:
             group.match_status = f"lookup failed: {exc}"
             status(f"    {group.match_status}")
@@ -379,11 +385,15 @@ def print_review(groups: list[AlbumGroup], library_root: Path, multidisc: bool, 
 
 
 def edit_album(group: AlbumGroup) -> None:
+    old_identity = (group.album_artist, group.artist, group.album, group.year)
     for attr, label in [("album_artist", "Album artist"), ("artist", "Default track artist"), ("album", "Album"), ("year", "Year")]:
         current = getattr(group, attr)
         value = input(f"{label} [{current}]: ").strip()
         if value:
             setattr(group, attr, value)
+    if (group.album_artist, group.artist, group.album, group.year) != old_identity and group.musicbrainz_releaseid:
+        group.musicbrainz_releaseid = ""
+        group.match_status = "metadata edited; release lookup needed"
     for track in group.tracks:
         if not track.artist or track.artist == group.artist:
             track.artist = group.artist
@@ -450,7 +460,7 @@ def stage_import(groups: list[AlbumGroup], stage: Path, source_root: Path, multi
             continue
         status(f"Staging album: {group.album_artist} - {group.album} ({len(group.tracks)} track(s))")
         album_dir = stage / proposed_album_dir(group)
-        artifact_dir = album_dir / ".library-import"
+        artifact_dir = album_dir / ARTIFACT_DIR_NAME
         artifact_dir.mkdir(parents=True, exist_ok=True)
         album_tracks = []
         for track in group.tracks:
@@ -480,9 +490,9 @@ def stage_import(groups: list[AlbumGroup], stage: Path, source_root: Path, multi
     for album in albums:
         artifact_dir = stage / sanitize_component(album["album_artist"]) / sanitize_component(
             f'{album["album"]} ({album["year"]})' if album["year"] else album["album"]
-        ) / ".library-import"
+        ) / ARTIFACT_DIR_NAME
         artifact_dir.mkdir(parents=True, exist_ok=True)
-        (artifact_dir / "IMPORT_MANIFEST.json").write_text(json.dumps(album, indent=2) + "\n", encoding="utf-8")
+        (artifact_dir / IMPORT_MANIFEST_NAME).write_text(json.dumps(album, indent=2) + "\n", encoding="utf-8")
     return manifest
 
 
@@ -498,6 +508,147 @@ def copy_album_cover(source_root: Path, group: AlbumGroup, album_dir: Path, arti
                 if not artifact_target.exists():
                     shutil.copy2(candidate, artifact_target)
                 return
+
+
+def has_audio_files(path: Path) -> bool:
+    return any(child.is_file() and child.suffix.lower() in SUPPORTED_EXTENSIONS for child in path.iterdir())
+
+
+def has_album_cover(path: Path) -> bool:
+    return any((path / name).exists() for name in COVER_NAMES)
+
+
+def has_disc_audio(path: Path) -> bool:
+    for child in path.iterdir():
+        if child.is_dir() and re.fullmatch(r"CD ?\d+|Disc ?\d+", child.name, flags=re.IGNORECASE):
+            if has_audio_files(child):
+                return True
+    return False
+
+
+def discover_album_dirs(root: Path) -> list[Path]:
+    albums: list[Path] = []
+    for path, dirnames, _filenames in os.walk(root):
+        dirnames[:] = [name for name in dirnames if not name.startswith(".")]
+        current = Path(path)
+        if has_audio_files(current) or has_disc_audio(current):
+            albums.append(current)
+            dirnames[:] = []
+    return sorted(albums)
+
+
+def parse_album_folder_name(name: str) -> tuple[str, str]:
+    match = re.match(r"^(?P<album>.+?)\s+\((?P<year>(?:19|20)\d{2})\)$", name)
+    if match:
+        return match.group("album"), match.group("year")
+    return name, ""
+
+
+def album_info_from_dir(album_dir: Path, library_root: Path) -> dict[str, str]:
+    manifest = album_dir / ARTIFACT_DIR_NAME / IMPORT_MANIFEST_NAME
+    if manifest.exists():
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            return {
+                "album_artist": str(data.get("album_artist") or album_dir.parent.name),
+                "album": str(data.get("album") or parse_album_folder_name(album_dir.name)[0]),
+                "year": str(data.get("year") or parse_album_folder_name(album_dir.name)[1]),
+                "musicbrainz_releaseid": str(data.get("musicbrainz_releaseid") or ""),
+            }
+        except (OSError, json.JSONDecodeError):
+            pass
+    album, year = parse_album_folder_name(album_dir.name)
+    artist = album_dir.parent.name if album_dir.parent != library_root else "Unknown Artist"
+    return {"album_artist": artist, "album": album, "year": year, "musicbrainz_releaseid": ""}
+
+
+def find_musicbrainz_release_id(album_artist: str, album: str, year: str, last_request: float) -> tuple[str, str, float]:
+    if not album or album == "Unknown Album":
+        return "", "not enough metadata", last_request
+    query_bits = [f'release:"{album}"']
+    if album_artist and album_artist != "Unknown Artist":
+        query_bits.append(f'artist:"{album_artist}"')
+    if year:
+        query_bits.append(f"date:{year}")
+    query = " AND ".join(query_bits)
+    url = "https://musicbrainz.org/ws/2/release/?" + urllib.parse.urlencode({"query": query, "fmt": "json", "limit": "5"})
+    try:
+        last_request = wait_for_musicbrainz(last_request)
+        data = musicbrainz_json(url)
+    except Exception as exc:
+        return "", f"lookup failed: {exc}", last_request
+    group = AlbumGroup(key="", album_artist=album_artist, album=album, year=year)
+    releases = data.get("releases", []) or []
+    if not releases:
+        return "", "no MusicBrainz match", last_request
+    best = max(releases, key=lambda r: release_score(group, r))
+    if release_score(group, best) < 4:
+        return "", "weak MusicBrainz match ignored", last_request
+    return str(best.get("id") or ""), "MusicBrainz candidate", last_request
+
+
+def download_cover_jpg(release_id: str, target: Path) -> str:
+    url = f"https://coverartarchive.org/release/{release_id}/front-500"
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    tmp = target.with_suffix(".jpg.tmp")
+    with urllib.request.urlopen(request, timeout=20) as response:
+        content = response.read()
+    if not content:
+        return "empty cover response"
+    tmp.write_bytes(content)
+    tmp.replace(target)
+    return "downloaded"
+
+
+def cmd_covers(args: argparse.Namespace) -> int:
+    global STATUS_DELAY
+    STATUS_DELAY = args.delay
+    root = Path(args.library_root).expanduser().resolve()
+    overwrite = args.overwrite == "yes"
+    if not root.is_dir():
+        print(f"Not a directory: {root}", file=sys.stderr)
+        return 2
+
+    albums = discover_album_dirs(root)
+    status(f"Scanning {root} for album folders...")
+    status(f"Found {len(albums)} album folder(s).")
+    downloaded = 0
+    skipped = 0
+    failed = 0
+    last_request = 0.0
+
+    for index, album_dir in enumerate(albums, 1):
+        info = album_info_from_dir(album_dir, root)
+        label = f"{info['album_artist']} - {info['album']}"
+        status(f"  Covers {index}/{len(albums)}: {label}")
+        target = album_dir / "cover.jpg"
+        if has_album_cover(album_dir) and not overwrite:
+            status("    local cover already exists; skipping")
+            skipped += 1
+            continue
+        release_id = info["musicbrainz_releaseid"]
+        if not release_id:
+            release_id, match_status, last_request = find_musicbrainz_release_id(info["album_artist"], info["album"], info["year"], last_request)
+            if not release_id:
+                status(f"    {match_status}; no cover downloaded")
+                failed += 1
+                continue
+        try:
+            result = download_cover_jpg(release_id, target)
+        except Exception as exc:
+            status(f"    cover download failed: {exc}")
+            failed += 1
+            continue
+        status(f"    saved {target.name} ({result})")
+        downloaded += 1
+
+    print()
+    print("Cover download summary:")
+    print(f"  Albums scanned:       {len(albums)}")
+    print(f"  Covers downloaded:    {downloaded}")
+    print(f"  Existing/skipped:     {skipped}")
+    print(f"  Missing/failed:       {failed}")
+    return 0 if failed == 0 or downloaded > 0 or skipped > 0 else 1
 
 
 def cmd_import(args: argparse.Namespace) -> int:
@@ -546,6 +697,11 @@ def build_parser() -> argparse.ArgumentParser:
     importer.add_argument("--delay", type=float, default=0.0)
     importer.add_argument("--result-file", required=True)
     importer.set_defaults(func=cmd_import)
+    covers = subparsers.add_parser("covers", help="download missing album cover.jpg files")
+    covers.add_argument("--library-root", required=True)
+    covers.add_argument("--overwrite", choices=["yes", "no"], default="no")
+    covers.add_argument("--delay", type=float, default=0.0)
+    covers.set_defaults(func=cmd_covers)
     return parser
 
 

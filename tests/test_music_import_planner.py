@@ -2,9 +2,14 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from lib.music_import_planner import (
+    AlbumGroup,
+    album_info_from_dir,
     assign_destinations,
+    discover_album_dirs,
+    edit_album,
     group_tracks,
     sanitize_component,
     stage_import,
@@ -142,6 +147,80 @@ class MusicImportPlannerTests(unittest.TestCase):
             self.assertTrue(manifest_path.exists())
             self.assertEqual(manifest["copied_tracks"], 1)
             self.assertEqual(json.loads(manifest_path.read_text())["album"], "XO")
+
+    def test_discover_album_dirs_handles_direct_and_cd_audio(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            direct = root / "Elliott Smith" / "XO (1998)"
+            multidisc = root / "Elliott Smith" / "New Moon (2006)"
+            direct.mkdir(parents=True)
+            (multidisc / "CD1").mkdir(parents=True)
+            (multidisc / "CD2").mkdir(parents=True)
+            (direct / "01 - Sweet Adeline.m4a").write_bytes(b"audio")
+            (multidisc / "CD1" / "01 - Angel In The Snow.mp3").write_bytes(b"audio")
+            (multidisc / "CD2" / "01 - Georgia, Georgia.mp3").write_bytes(b"audio")
+
+            albums = discover_album_dirs(root)
+
+            self.assertEqual(albums, [multidisc, direct])
+
+    def test_album_info_prefers_import_manifest_then_folder_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            album_dir = root / "Elliott Smith" / "XO (1998)"
+            manifest_dir = album_dir / ".library-import"
+            manifest_dir.mkdir(parents=True)
+            (manifest_dir / "IMPORT_MANIFEST.json").write_text(
+                json.dumps(
+                    {
+                        "album_artist": "Elliott Smith",
+                        "album": "XO",
+                        "year": "1998",
+                        "musicbrainz_releaseid": "release-id",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                album_info_from_dir(album_dir, root),
+                {
+                    "album_artist": "Elliott Smith",
+                    "album": "XO",
+                    "year": "1998",
+                    "musicbrainz_releaseid": "release-id",
+                },
+            )
+
+            fallback_dir = root / "Elliott Smith" / "Figure 8 (2000)"
+            fallback_dir.mkdir(parents=True)
+            self.assertEqual(
+                album_info_from_dir(fallback_dir, root),
+                {
+                    "album_artist": "Elliott Smith",
+                    "album": "Figure 8",
+                    "year": "2000",
+                    "musicbrainz_releaseid": "",
+                },
+            )
+
+    def test_edit_album_clears_stale_release_id_when_identity_changes(self):
+        group = AlbumGroup(
+            key="",
+            album_artist="Elliott Smith",
+            artist="Elliott Smith",
+            album="Elliott Smith",
+            year="2020",
+            musicbrainz_releaseid="old-release",
+            match_status="MusicBrainz candidate: old-release",
+        )
+
+        with patch("builtins.input", side_effect=["", "", "", "1995"]):
+            edit_album(group)
+
+        self.assertEqual(group.year, "1995")
+        self.assertEqual(group.musicbrainz_releaseid, "")
+        self.assertEqual(group.match_status, "metadata edited; release lookup needed")
 
 
 if __name__ == "__main__":

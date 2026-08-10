@@ -89,6 +89,8 @@ You do not need to repeat drive setup every time. Whipper saves the drive offset
 
 For existing digital music, choose `Import existing digital music directory`, point the wizard at the source folder, review the inferred albums/tracks, make any corrections, and accept the import. The wizard copies into a temporary staging directory first and leaves the original source files untouched.
 
+Before a digital import publishes anything, the wizard shows the current output root and lets you enter a different library/output directory for that run. If you enter one, it is saved for future runs.
+
 MP3 and M4A files are preserved as MP3 and M4A. Converting lossy files to FLAC is technically possible, but it does not restore quality and usually only makes the files larger.
 
 The wizard prints progress while scanning files, looking up album metadata, staging output, and publishing. It also uses a small delay between major status messages so interactive runs are readable. Set `WIZARD_STEP_DELAY=0` for fast scripted runs:
@@ -106,6 +108,8 @@ If one or more CD tracks fail but other tracks were ripped, the wizard publishes
 Digital imports use `ffprobe` readability, embedded tags, filename/folder inference, MusicBrainz search, and your confirmation as their verification flow. They do not have AccurateRip verification because they are not being read from the original CD.
 
 Digital imports are safe to rerun. Existing files with identical bytes are treated as already imported and skipped. If a destination file exists but differs, publishing stops and keeps the staged output for review.
+
+The `Download missing album covers` menu option scans album folders under your selected output root, skips albums that already have local artwork, and saves downloaded art as `cover.jpg` beside the tracks. Jellyfin documents `cover.jpg` as a primary music artwork filename, and Plex supports local sidecar artwork for music libraries when local artwork is enabled/preferred.
 
 Damaged disc mode is available from the main menu. It keeps the same Whipper metadata, release selection, staging, cover-art, and publishing flow, but uses fewer retries per track so an obviously bad disc does not stall for ages. If a normal rip gives up on a track and readable FLACs were staged, the wizard can offer one automatic damaged-mode retry before publishing the partial album. Normal and damaged attempts are kept until publishing, then merged so the best available track from either attempt is used.
 
@@ -130,6 +134,10 @@ The wizard shows numbered choices and then passes the selected MusicBrainz relea
 ### Digital import metadata looks wrong
 
 Use the import review to edit album or track metadata before accepting. The wizard reads embedded tags first, falls back to folder and filename patterns, and then searches MusicBrainz for likely release information. Messy downloads, bootlegs, singles folders, and unofficial compilations may still need human correction.
+
+### Album covers are missing
+
+Run `Download missing album covers` from the main menu after importing. The job uses stored MusicBrainz release IDs from `.library-import/IMPORT_MANIFEST.json` when available, otherwise it searches MusicBrainz from the artist, album, and year inferred from the folder path. Cover Art Archive images are saved as album-level `cover.jpg` files.
 
 ### Cover art fetch crashes before ripping
 

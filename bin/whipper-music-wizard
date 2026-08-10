@@ -425,6 +425,22 @@ ensure_digital_import_deps() {
   fi
 }
 
+choose_output_root_for_job() {
+  local label="$1"
+  local v
+
+  echo
+  echo "$label output directory:"
+  echo "  Current: $OUT_ROOT"
+  read -rp "Use a different library/output directory for this run? Enter path or press ENTER to keep: " v
+  if [[ -n "${v:-}" ]]; then
+    OUT_ROOT="$v"
+    mkdir -p "$OUT_ROOT"
+    save_cfg
+    say_status "✔ Output directory saved: $OUT_ROOT"
+  fi
+}
+
 pick_device() {
   echo
   echo "Available CD devices (common):"
@@ -1776,6 +1792,8 @@ import_digital_music() {
     return 1
   fi
 
+  choose_output_root_for_job "Digital import"
+
   audio_count="$(find "$source" -type f \( \
     -iname '*.flac' -o -iname '*.mp3' -o -iname '*.m4a' -o -iname '*.alac' \
     -o -iname '*.aac' -o -iname '*.ogg' -o -iname '*.opus' \
@@ -1852,6 +1870,31 @@ import_digital_music() {
   print_digital_import_summary "$start_time" "$status" "$stage" "$result" "$kept_paths"
   [[ "$status" == "digital import published" ]] || return 1
   return 0
+}
+
+download_missing_album_covers() {
+  ensure_digital_import_deps || return 1
+  choose_output_root_for_job "Album cover download"
+  mkdir -p "$OUT_ROOT"
+
+  local overwrite
+  echo
+  echo "This job scans album folders under:"
+  echo "  $OUT_ROOT"
+  echo "It saves missing album artwork as cover.jpg in each album directory."
+  echo "That filename is recognized as local album artwork by Jellyfin and is the common Plex-friendly sidecar name."
+  read -rp "Overwrite existing local cover/folder artwork? [y/N] " overwrite
+  if is_yes "${overwrite:-}"; then
+    overwrite="yes"
+  else
+    overwrite="no"
+  fi
+
+  say_status "Starting album cover download."
+  python3 "$IMPORT_HELPER" covers \
+    --library-root "$OUT_ROOT" \
+    --overwrite "$overwrite" \
+    --delay "$WIZARD_STEP_DELAY"
 }
 
 print_digital_import_summary() {
@@ -1976,9 +2019,10 @@ main_menu() {
   echo "6) Rip a CD in damaged disc mode"
   echo "7) Repair/merge a staged partial rip"
   echo "8) Import existing digital music directory"
-  echo "9) Quit"
+  echo "9) Download missing album covers"
+  echo "10) Quit"
   echo
-  read -rp "Choose [1-9]: " choice
+  read -rp "Choose [1-10]: " choice
   choice="${choice//[[:space:]]/}"
   case "$choice" in
     1) ensure_deps || rc=$? ;;
@@ -1989,7 +2033,8 @@ main_menu() {
     6) rip_cd yes || rc=$? ;;
     7) repair_staged_partial || rc=$? ;;
     8) import_digital_music || rc=$? ;;
-    9) exit 0 ;;
+    9) download_missing_album_covers || rc=$? ;;
+    10) exit 0 ;;
     *) echo "Invalid choice." ;;
   esac
 
