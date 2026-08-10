@@ -601,6 +601,12 @@ def coverart_bytes(entity: str, entity_id: str) -> bytes:
         return response.read()
 
 
+def download_url_bytes(url: str) -> bytes:
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(request, timeout=20) as response:
+        return response.read()
+
+
 def download_cover_jpg(release_id: str, release_group_id_value: str, target: Path, last_request: float) -> tuple[str, float]:
     tmp = target.with_suffix(".jpg.tmp")
     errors: list[str] = []
@@ -627,6 +633,67 @@ def download_cover_jpg(release_id: str, release_group_id_value: str, target: Pat
     if release_group_id_value and errors:
         return "downloaded from release group", last_request
     return "downloaded", last_request
+
+
+def normalize_text(value: str) -> str:
+    value = re.sub(r"\([^)]*\)", "", value)
+    value = re.sub(r"[^a-z0-9]+", " ", value.casefold())
+    return re.sub(r" +", " ", value).strip()
+
+
+def album_match_score(album_artist: str, album: str, candidate: dict[str, Any]) -> int:
+    candidate_album = normalize_text(str(candidate.get("title") or ""))
+    wanted_album = normalize_text(album)
+    artist_data = candidate.get("artist") if isinstance(candidate.get("artist"), dict) else {}
+    candidate_artist = normalize_text(str(artist_data.get("name") or candidate.get("artistName") or ""))
+    wanted_artist = normalize_text(album_artist)
+    score = 0
+    if candidate_album == wanted_album:
+        score += 5
+    elif candidate_album and wanted_album and (candidate_album in wanted_album or wanted_album in candidate_album):
+        score += 2
+    if candidate_artist == wanted_artist:
+        score += 4
+    elif candidate_artist and wanted_artist and (candidate_artist in wanted_artist or wanted_artist in candidate_artist):
+        score += 2
+    return score
+
+
+def deezer_json(url: str) -> dict[str, Any]:
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(request, timeout=12) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def find_deezer_cover_url(album_artist: str, album: str) -> tuple[str, str]:
+    query = f'artist:"{album_artist}" album:"{album}"'
+    url = "https://api.deezer.com/search/album?" + urllib.parse.urlencode({"q": query, "limit": "10"})
+    data = deezer_json(url)
+    candidates = data.get("data", []) or []
+    if not candidates:
+        return "", "no Deezer match"
+    best = max(candidates, key=lambda candidate: album_match_score(album_artist, album, candidate))
+    if album_match_score(album_artist, album, best) < 7:
+        return "", "weak Deezer match ignored"
+    cover = str(best.get("cover_xl") or best.get("cover_big") or best.get("cover_medium") or "")
+    if not cover:
+        return "", "Deezer match had no cover URL"
+    artist_data = best.get("artist") if isinstance(best.get("artist"), dict) else {}
+    label = f"{artist_data.get('name') or album_artist} - {best.get('title') or album}"
+    return cover, f"Deezer: {label}"
+
+
+def download_deezer_cover(album_artist: str, album: str, target: Path) -> str:
+    cover_url, match_status = find_deezer_cover_url(album_artist, album)
+    if not cover_url:
+        return match_status
+    content = download_url_bytes(cover_url)
+    if not content:
+        return "empty Deezer cover response"
+    tmp = target.with_suffix(".jpg.tmp")
+    tmp.write_bytes(content)
+    tmp.replace(target)
+    return f"downloaded from {match_status}"
 
 
 def cmd_covers(args: argparse.Namespace) -> int:
@@ -665,17 +732,32 @@ def cmd_covers(args: argparse.Namespace) -> int:
         if not release_id:
             release_id, release_group_id_value, match_status, last_request = find_musicbrainz_release(info["album_artist"], info["album"], info["year"], last_request)
             if not release_id:
-                status(f"    {match_status}; no cover downloaded")
-                failed += 1
+                status(f"    primary lookup failed: {match_status}")
+                try:
+                    result = download_deezer_cover(info["album_artist"], info["album"], target)
+                except Exception as exc:
+                    result = f"Deezer lookup failed: {exc}"
+                if not result.startswith("downloaded"):
+                    status(f"    secondary cover lookup failed: {result}")
+                    failed += 1
+                    continue
+                status(f"    saved {target.name} ({result})")
+                downloaded += 1
                 continue
         try:
             result, last_request = download_cover_jpg(release_id, release_group_id_value, target, last_request)
         except Exception as exc:
             result = f"cover download failed: {exc}"
         if result != "downloaded" and not result.startswith("downloaded"):
-            status(f"    cover download failed: {result}")
-            failed += 1
-            continue
+            status(f"    Cover Art Archive failed: {result}")
+            try:
+                result = download_deezer_cover(info["album_artist"], info["album"], target)
+            except Exception as exc:
+                result = f"Deezer lookup failed: {exc}"
+            if not result.startswith("downloaded"):
+                status(f"    secondary cover lookup failed: {result}")
+                failed += 1
+                continue
         status(f"    saved {target.name} ({result})")
         downloaded += 1
 

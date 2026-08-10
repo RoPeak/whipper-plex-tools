@@ -109,7 +109,7 @@ Digital imports use `ffprobe` readability, embedded tags, filename/folder infere
 
 Digital imports are safe to rerun. Existing files with identical bytes are treated as already imported and skipped. If a destination file exists but differs, publishing stops and keeps the staged output for review.
 
-The `Download missing album covers` menu option scans album folders under your selected output root, skips albums that already have local artwork, and saves downloaded art as `cover.jpg` beside the tracks. Jellyfin documents `cover.jpg` as a primary music artwork filename, and Plex supports local sidecar artwork for music libraries when local artwork is enabled/preferred.
+The `Download missing album covers` menu option scans album folders under your selected output root, skips albums that already have local artwork, and saves downloaded art as `cover.jpg` beside the tracks. It tries MusicBrainz/Cover Art Archive first, then falls back to Deezer album search when the primary source has no usable image. Jellyfin documents `cover.jpg` as a primary music artwork filename, and Plex supports local sidecar artwork for music libraries when local artwork is enabled/preferred.
 
 Damaged disc mode is available from the main menu. It keeps the same Whipper metadata, release selection, staging, cover-art, and publishing flow, but uses fewer retries per track so an obviously bad disc does not stall for ages. If a normal rip gives up on a track and readable FLACs were staged, the wizard can offer one automatic damaged-mode retry before publishing the partial album. Normal and damaged attempts are kept until publishing, then merged so the best available track from either attempt is used.
 
@@ -141,7 +141,7 @@ Shell shortcuts such as `~/Downloads/...` are accepted in wizard path prompts. I
 
 Run `Download missing album covers` from the main menu after importing. The job uses stored MusicBrainz release IDs from `.library-import/IMPORT_MANIFEST.json` when available, otherwise it searches MusicBrainz from the artist, album, and year inferred from the folder path. Cover Art Archive images are saved as album-level `cover.jpg` files.
 
-Some unofficial, soundtrack-only, or bootleg-style folders may not have a MusicBrainz/Cover Art Archive cover. When a folder year appears wrong, the cover job retries the search without that year before giving up.
+Some unofficial, soundtrack-only, or bootleg-style folders may not have a MusicBrainz/Cover Art Archive cover. When a folder year appears wrong, the cover job retries the search without that year. If Cover Art Archive still fails, it searches Deezer for a strong artist/album match and uses `cover_xl`/`cover_big` artwork when available.
 
 ### Cover art fetch crashes before ripping
 

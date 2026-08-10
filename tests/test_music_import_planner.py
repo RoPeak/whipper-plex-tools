@@ -8,9 +8,12 @@ from unittest.mock import patch
 from lib.music_import_planner import (
     AlbumGroup,
     album_info_from_dir,
+    cmd_covers,
     assign_destinations,
     discover_album_dirs,
     download_cover_jpg,
+    download_deezer_cover,
+    find_deezer_cover_url,
     edit_album,
     find_musicbrainz_release,
     group_tracks,
@@ -265,6 +268,81 @@ class MusicImportPlannerTests(unittest.TestCase):
 
         self.assertEqual(result, "downloaded from release group")
         self.assertEqual(target.read_bytes(), b"jpg")
+
+    def test_find_deezer_cover_url_uses_strong_album_artist_match(self):
+        response = {
+            "data": [
+                {
+                    "title": "Greatest Hits",
+                    "artist": {"name": "Elliott Smith"},
+                    "cover_xl": "https://example.test/wrong.jpg",
+                },
+                {
+                    "title": "Roman Candle",
+                    "artist": {"name": "Elliott Smith"},
+                    "cover_xl": "https://example.test/right.jpg",
+                },
+            ]
+        }
+
+        with patch("lib.music_import_planner.deezer_json", return_value=response):
+            url, status = find_deezer_cover_url("Elliott Smith", "Roman Candle")
+
+        self.assertEqual(url, "https://example.test/right.jpg")
+        self.assertEqual(status, "Deezer: Elliott Smith - Roman Candle")
+
+    def test_find_deezer_cover_url_rejects_weak_match(self):
+        response = {
+            "data": [
+                {
+                    "title": "Greatest Hits",
+                    "artist": {"name": "Someone Else"},
+                    "cover_xl": "https://example.test/wrong.jpg",
+                }
+            ]
+        }
+
+        with patch("lib.music_import_planner.deezer_json", return_value=response):
+            url, status = find_deezer_cover_url("Elliott Smith", "Roman Candle")
+
+        self.assertEqual(url, "")
+        self.assertEqual(status, "weak Deezer match ignored")
+
+    def test_download_deezer_cover_writes_cover_file(self):
+        target = Path(tempfile.mkdtemp()) / "cover.jpg"
+
+        with patch("lib.music_import_planner.find_deezer_cover_url", return_value=("https://example.test/cover.jpg", "Deezer: Artist - Album")), patch(
+            "lib.music_import_planner.download_url_bytes", return_value=b"jpg"
+        ):
+            result = download_deezer_cover("Artist", "Album", target)
+
+        self.assertEqual(result, "downloaded from Deezer: Artist - Album")
+        self.assertEqual(target.read_bytes(), b"jpg")
+
+    def test_cover_job_tries_deezer_when_musicbrainz_has_no_match(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            album_dir = root / "Elliott Smith" / "Roman Candle (1994)"
+            album_dir.mkdir(parents=True)
+            (album_dir / "01 - Roman Candle.mp3").write_bytes(b"audio")
+
+            args = type(
+                "Args",
+                (),
+                {
+                    "library_root": str(root),
+                    "overwrite": "no",
+                    "delay": 0.0,
+                },
+            )()
+
+            with patch("lib.music_import_planner.find_musicbrainz_release", return_value=("", "", "no MusicBrainz match", 0.0)), patch(
+                "lib.music_import_planner.download_deezer_cover", return_value="downloaded from Deezer: Elliott Smith - Roman Candle"
+            ) as deezer:
+                status = cmd_covers(args)
+
+        self.assertEqual(status, 0)
+        deezer.assert_called_once()
 
 
 if __name__ == "__main__":
