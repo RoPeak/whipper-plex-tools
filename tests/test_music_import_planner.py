@@ -19,7 +19,6 @@ from lib.music_import_planner import (
     group_tracks,
     sanitize_component,
     stage_import,
-    merge_audio_tags,
     track_from_probe,
 )
 
@@ -39,7 +38,7 @@ class MusicImportPlannerTests(unittest.TestCase):
             path.parent.mkdir()
             path.write_bytes(b"audio")
 
-            track = merge_audio_tags(
+            track = track_from_probe(
                 path,
                 root,
                 probe(
@@ -143,8 +142,8 @@ class MusicImportPlannerTests(unittest.TestCase):
 
             self.assertEqual(len(groups), 1)
             self.assertEqual(groups[0].album, "In Rainbows")
-            self.assertEqual(tracks[0].proposed_rel, "Radiohead/In Rainbows (2023)/CD 1/01 - 15 Step.flac")
-            self.assertEqual(tracks[1].proposed_rel, "Radiohead/In Rainbows (2023)/CD 2/01 - Mk 1.flac")
+            self.assertEqual(tracks[0].proposed_rel, "Radiohead/In Rainbows (2023)/1-01 - 15 Step.flac")
+            self.assertEqual(tracks[1].proposed_rel, "Radiohead/In Rainbows (2023)/2-01 - Mk 1.flac")
 
     def test_filename_fallback_handles_multidisc_album(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -153,7 +152,7 @@ class MusicImportPlannerTests(unittest.TestCase):
             path.parent.mkdir(parents=True)
             path.write_bytes(b"audio")
 
-            track = merge_audio_tags(path, root, probe({}))
+            track = track_from_probe(path, root, probe({}))
             groups = group_tracks([track])
             groups[0].year = "2007"
             assign_destinations(groups, multidisc=True, include_track_artist=False)
@@ -181,7 +180,7 @@ class MusicImportPlannerTests(unittest.TestCase):
             for path in paths:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(b"audio")
-            tracks = [merge_audio_tags(path, root, probe({})) for path in paths]
+            tracks = [track_from_probe(path, root, probe({})) for path in paths]
             groups = group_tracks(tracks)
             groups[0].year = "2006"
             assign_destinations(groups, multidisc=False, include_track_artist=False)
@@ -206,8 +205,8 @@ class MusicImportPlannerTests(unittest.TestCase):
                 path.parent.mkdir(exist_ok=True)
                 path.write_bytes(b"audio")
             tracks = [
-                merge_audio_tags(paths[0], root, probe({"artist": "Elliott Smith", "album": "B-Sides & Other Songs", "track": "1", "title": "Stickman"})),
-                merge_audio_tags(paths[1], root, probe({"artist": "Elliott Smith", "album": "B-Sides & Other Songs", "track": "1", "title": "Stickman"})),
+                track_from_probe(paths[0], root, probe({"artist": "Elliott Smith", "album": "B-Sides & Other Songs", "track": "1", "title": "Stickman"})),
+                track_from_probe(paths[1], root, probe({"artist": "Elliott Smith", "album": "B-Sides & Other Songs", "track": "1", "title": "Stickman"})),
             ]
 
             groups = group_tracks(tracks)
@@ -226,7 +225,7 @@ class MusicImportPlannerTests(unittest.TestCase):
             source = root / "XO" / "03 Waltz #2.m4a"
             source.parent.mkdir(parents=True)
             source.write_bytes(b"audio")
-            track = merge_audio_tags(
+            track = track_from_probe(
                 source,
                 root,
                 probe({"artist": "Elliott Smith", "album": "XO", "date": "1998", "track": "3", "title": "Waltz #2"}),

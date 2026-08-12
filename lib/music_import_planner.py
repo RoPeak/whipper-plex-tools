@@ -18,8 +18,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from numpy import source
-from sympy import root
 
 
 SUPPORTED_EXTENSIONS = {".flac", ".mp3", ".m4a", ".alac", ".aac", ".ogg", ".opus"}
@@ -243,7 +241,7 @@ def scan_source(root: Path) -> list[Track]:
     for index, path in enumerate(paths, 1):
         if index == 1 or index % 10 == 0 or index == len(paths):
             status(f"  ffprobe metadata: {index}/{len(paths)}")
-        tracks.append(merge_audio_tags(path, root, ffprobe_json(path)))
+        tracks.append(track_from_probe(path, root, ffprobe_json(path)))
     return tracks
 
 
