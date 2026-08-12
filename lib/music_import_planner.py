@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections import Counter, defaultdict
@@ -182,10 +183,44 @@ def merged_audio_tags(probe: dict[str, Any]) -> dict[str, Any]:
 def disc_folder_number(path: Path, root: Path) -> int:
     if path.parent == root:
         return 0
-    match = re.fullmatch(r"(?:CD|Disc)\s*0*(\d+)", path.parent.name, flags=re.IGNORECASE)
+    match = re.search(
+        r"(?:^|[\s\[(\-_])(?:CD|Disc)\s*[-_ ]?0*(\d+)(?=$|[\s\])_\-])",
+        path.parent.name,
+        flags=re.IGNORECASE,
+    )
     return int(match.group(1)) if match else 0
 
-def normalise_disc_album_name(album: str, disc: int, parent_disc: int):
+
+def album_container_name(source: Path, root: Path, artist: str, year: str) -> str:
+    """Infer the shared album name above an explicitly numbered disc folder."""
+    container = source.parent.parent
+    if container != root:
+        try:
+            container.relative_to(root)
+        except ValueError:
+            return ""
+
+    name = container.name.strip()
+    if artist:
+        name = re.sub(
+            rf"^{re.escape(artist)}\s*[-–—]\s*",
+            "",
+            name,
+            count=1,
+            flags=re.IGNORECASE,
+        ).strip()
+
+    year_match = re.search(r"\s*[\[(]\s*(?:19|20)\d{2}\s*[\])]", name)
+    if year_match:
+        name = name[: year_match.start()].strip()
+    elif year:
+        year_match = re.search(rf"\s*[\[(]\s*{re.escape(year)}\s*[\])]", name)
+        if year_match:
+            name = name[: year_match.start()].strip()
+    return name
+
+
+def normalise_disc_album_name(album: str, disc: int, parent_disc: int, container_album: str = ""):
     if not album or not parent_disc or disc != parent_disc:
         return album
     patterns = [
@@ -197,7 +232,16 @@ def normalise_disc_album_name(album: str, disc: int, parent_disc: int):
         match = re.match(pattern, album, flags=re.IGNORECASE)
         if match and int(match.group("disc")) == parent_disc:
             return match.group("album").strip()
+
+    explicit_disc = re.search(
+        r"(?:^|[\s\[(\-_])(?:CD|Disc)\s*[-_ ]?0*(\d+)(?=$|[\s\])_\-])",
+        album,
+        flags=re.IGNORECASE,
+    )
+    if explicit_disc and int(explicit_disc.group(1)) == parent_disc and container_album:
+        return container_album
     return album
+
 
 def track_from_probe(source: Path, root: Path, probe: dict[str, Any]) -> Track:
     tags = merged_audio_tags(probe)
@@ -206,20 +250,23 @@ def track_from_probe(source: Path, root: Path, probe: dict[str, Any]) -> Track:
     rel_parts = source.relative_to(root).parts
     parent_album = rel_parts[-2] if len(rel_parts) >= 2 else ""
     parent_artist = rel_parts[-3] if len(rel_parts) >= 3 else (root.name if len(rel_parts) >= 2 else "")
+    artist = first_tag(tags, "artist", "album_artist", "albumartist") or parent_artist
+    year = parse_year(first_tag(tags, "date", "year"))
     disc_from_tag = parse_number(first_tag(tags, "disc", "discnumber"))
-    disc = disc_from_tag or parent_disc or disc_from_name or 1
+    disc = parent_disc or disc_from_tag or disc_from_name or 1
     album = first_tag(tags, "album") or parent_album
-    album = normalise_disc_album_name(album, disc, parent_disc)
+    container_album = album_container_name(source, root, artist, year) if parent_disc else ""
+    album = normalise_disc_album_name(album, disc, parent_disc, container_album)
 
     track = Track(
         source=source,
         rel_source=str(source.relative_to(root)),
         extension=source.suffix.lower(),
         title=first_tag(tags, "title") or title_from_name,
-        artist=first_tag(tags, "artist", "album_artist", "albumartist") or parent_artist,
+        artist=artist,
         album_artist=first_tag(tags, "album_artist", "albumartist", "album artist"),
         album=album,
-        year=parse_year(first_tag(tags, "date", "year")),
+        year=year,
         track=parse_number(first_tag(tags, "track", "tracknumber")) or track_from_name,
         disc=disc,
         total_discs=parse_number(first_tag(tags, "disctotal", "totaldiscs")),
@@ -275,8 +322,25 @@ def most_common(values: list[str]) -> str:
 
 def musicbrainz_json(url: str) -> dict[str, Any]:
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
-    with urllib.request.urlopen(request, timeout=12) as response:
-        return json.loads(response.read().decode("utf-8"))
+    retry_delays = (2.0, 4.0, 8.0)
+    for attempt in range(len(retry_delays) + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=12) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            transient = exc.code in {429, 500, 502, 503, 504}
+            if not transient or attempt >= len(retry_delays):
+                raise
+            delay = retry_delays[attempt]
+            retry_after = exc.headers.get("Retry-After") if exc.headers else None
+            if retry_after:
+                try:
+                    delay = max(delay, float(retry_after))
+                except ValueError:
+                    pass
+            status(f"    MusicBrainz HTTP {exc.code}; retrying in {delay:g}s...")
+            time.sleep(delay)
+    raise RuntimeError("unreachable")
 
 
 def wait_for_musicbrainz(last_request: float) -> float:

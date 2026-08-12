@@ -17,6 +17,7 @@ from lib.music_import_planner import (
     edit_album,
     find_musicbrainz_release,
     group_tracks,
+    musicbrainz_json,
     sanitize_component,
     stage_import,
     track_from_probe,
@@ -144,6 +145,88 @@ class MusicImportPlannerTests(unittest.TestCase):
             self.assertEqual(groups[0].album, "In Rainbows")
             self.assertEqual(tracks[0].proposed_rel, "Radiohead/In Rainbows (2023)/1-01 - 15 Step.flac")
             self.assertEqual(tracks[1].proposed_rel, "Radiohead/In Rainbows (2023)/2-01 - Mk 1.flac")
+
+
+    def test_named_disc_folders_with_cd_markers_merge_into_container_album(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "To_Sort"
+            album_root = root / "Red Hot Chili Peppers - Stadium Arcadium [2006] [only1joe] FLAC-EAC"
+            paths = [
+                album_root / "Red Hot Chili Peppers - Stadium Arcadium Jupiter [CD-01] [2006]" / "01 - Dani California.flac",
+                album_root / "Red Hot Chili Peppers - Stadium Arcadium Mars [CD-02] [2006]" / "01 - Desecration Smile.flac",
+            ]
+            for path in paths:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"audio")
+
+            tracks = [
+                track_from_probe(
+                    paths[0],
+                    root,
+                    probe({
+                        "title": "Dani California",
+                        "artist": "Red Hot Chili Peppers",
+                        "album": "Stadium Arcadium Jupiter [CD-01]",
+                        "date": "2006",
+                        "track": "1",
+                    }),
+                ),
+                track_from_probe(
+                    paths[1],
+                    root,
+                    probe({
+                        "title": "Desecration Smile",
+                        "artist": "Red Hot Chili Peppers",
+                        "album": "Stadium Arcadium Mars [CD-02]",
+                        "date": "2006",
+                        "track": "1",
+                        "disc": "1",  # bad embedded tag; explicit [CD-02] folder must win
+                    }),
+                ),
+            ]
+
+            groups = group_tracks(tracks)
+            assign_destinations(groups, multidisc=False, include_track_artist=False)
+
+            self.assertEqual(len(groups), 1)
+            self.assertEqual(groups[0].album, "Stadium Arcadium")
+            self.assertEqual(tracks[0].disc, 1)
+            self.assertEqual(tracks[1].disc, 2)
+            self.assertEqual(
+                tracks[0].proposed_rel,
+                "Red Hot Chili Peppers/Stadium Arcadium (2006)/1-01 - Dani California.flac",
+            )
+            self.assertEqual(
+                tracks[1].proposed_rel,
+                "Red Hot Chili Peppers/Stadium Arcadium (2006)/2-01 - Desecration Smile.flac",
+            )
+
+    def test_musicbrainz_json_retries_transient_503(self):
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return b'{"releases": []}'
+
+        error = urllib.error.HTTPError(
+            "https://musicbrainz.org/ws/2/release/",
+            503,
+            "Service Temporarily Unavailable",
+            {},
+            None,
+        )
+        with patch("lib.music_import_planner.urllib.request.urlopen", side_effect=[error, FakeResponse()]) as urlopen, patch(
+            "lib.music_import_planner.time.sleep"
+        ) as sleep:
+            result = musicbrainz_json("https://musicbrainz.org/ws/2/release/?fmt=json")
+
+        self.assertEqual(result, {"releases": []})
+        self.assertEqual(urlopen.call_count, 2)
+        sleep.assert_called_once_with(2.0)
 
     def test_filename_fallback_handles_multidisc_album(self):
         with tempfile.TemporaryDirectory() as tmp:
