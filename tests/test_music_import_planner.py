@@ -19,6 +19,7 @@ from lib.music_import_planner import (
     group_tracks,
     sanitize_component,
     stage_import,
+    merge_audio_tags,
     track_from_probe,
 )
 
@@ -38,7 +39,7 @@ class MusicImportPlannerTests(unittest.TestCase):
             path.parent.mkdir()
             path.write_bytes(b"audio")
 
-            track = track_from_probe(
+            track = merge_audio_tags(
                 path,
                 root,
                 probe(
@@ -58,6 +59,93 @@ class MusicImportPlannerTests(unittest.TestCase):
             self.assertEqual(track.year, "1997")
             self.assertEqual(track.track, 1)
 
+    def test_attached_picture_stream_does_not_overwrite_tags(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "01 - Helena (So Long & Goodnight).flac"
+            path.write_bytes(b"audio")
+            metadata = {
+                "format": {
+                    "tags": {
+                        "title": "Helena (So Long & Goodnight)",
+                        "artist": "My Chemical Romance",
+                        "album": "Thre Cheers for Sweet Revenge", 
+                        "date": "2004",
+                        "track": "1",
+                    }
+                },
+                "streams": [
+                    {"codec_type": "audio", "tags": {}},
+                    {
+                        "codec_type": "video",
+                        "disposition": {"attached_pic": 1},
+                        "tags": {"title": "cover.jpg", "comment": "Cover (front)"},
+                    },
+                ],
+            }
+
+            track = track_from_probe(path, root, metadata)
+
+            self.assertEqual(track.title, "Helena (So Long & Goodnight)")
+            self.assertTrue(track.has_embedded_art)
+
+    def test_attached_picture_title_does_not_replace_filename_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "01 - Black Summer.mp3"
+            path.write_bytes(b"audio")
+            metadata = {
+                "format": {
+                    "tags": {
+                        "artist": "Red Hot Chili Peppers",
+                        "album": "Unlimited Love",
+                        "date": "2022",
+                        "track": "1",
+                    }
+                },
+                "streams": [
+                    {"codec_type": "audio", "tags": {}},
+                    {
+                        "codec_type": "video",
+                        "disposition": {"attached_pic": 1},
+                        "tags": {"title": "PMEDIA"},
+                    },
+                ],
+            }
+
+            track = track_from_probe(path, root, metadata)
+
+            self.assertEqual(track.title, "Black Summer")
+            self.assertTrue(track.has_embedded_art)
+
+    def test_numbered_disc_album_tags_are_normalised_inside_cd_folders(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = [root / "CD 1" / "01. 15 Step.flac", root / "CD 2" / "01. Mk 1.flac"]
+            for path in paths:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"audio")
+            tracks = [
+                track_from_probe(
+                    paths[0],
+                    root,
+                    probe({"artist": "Radiohead", "album": "In Rainbows (1)", "date": "2023", "track": "1", "disc": "1"}),
+                ),
+                track_from_probe(
+                    paths[1],
+                    root,
+                    probe({"artist": "Radiohead", "album": "In Rainbows (2)", "date": "2023", "track": "1", "disc": "2"}),
+                ),
+            ]
+
+            groups = group_tracks(tracks)
+            assign_destinations(groups, multidisc=False, include_track_artist=False)
+
+            self.assertEqual(len(groups), 1)
+            self.assertEqual(groups[0].album, "In Rainbows")
+            self.assertEqual(tracks[0].proposed_rel, "Radiohead/In Rainbows (2023)/CD 1/01 - 15 Step.flac")
+            self.assertEqual(tracks[1].proposed_rel, "Radiohead/In Rainbows (2023)/CD 2/01 - Mk 1.flac")
+
     def test_filename_fallback_handles_multidisc_album(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "Elliott Smith"
@@ -65,7 +153,7 @@ class MusicImportPlannerTests(unittest.TestCase):
             path.parent.mkdir(parents=True)
             path.write_bytes(b"audio")
 
-            track = track_from_probe(path, root, probe({}))
+            track = merge_audio_tags(path, root, probe({}))
             groups = group_tracks([track])
             groups[0].year = "2007"
             assign_destinations(groups, multidisc=True, include_track_artist=False)
@@ -93,7 +181,7 @@ class MusicImportPlannerTests(unittest.TestCase):
             for path in paths:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(b"audio")
-            tracks = [track_from_probe(path, root, probe({})) for path in paths]
+            tracks = [merge_audio_tags(path, root, probe({})) for path in paths]
             groups = group_tracks(tracks)
             groups[0].year = "2006"
             assign_destinations(groups, multidisc=False, include_track_artist=False)
@@ -118,8 +206,8 @@ class MusicImportPlannerTests(unittest.TestCase):
                 path.parent.mkdir(exist_ok=True)
                 path.write_bytes(b"audio")
             tracks = [
-                track_from_probe(paths[0], root, probe({"artist": "Elliott Smith", "album": "B-Sides & Other Songs", "track": "1", "title": "Stickman"})),
-                track_from_probe(paths[1], root, probe({"artist": "Elliott Smith", "album": "B-Sides & Other Songs", "track": "1", "title": "Stickman"})),
+                merge_audio_tags(paths[0], root, probe({"artist": "Elliott Smith", "album": "B-Sides & Other Songs", "track": "1", "title": "Stickman"})),
+                merge_audio_tags(paths[1], root, probe({"artist": "Elliott Smith", "album": "B-Sides & Other Songs", "track": "1", "title": "Stickman"})),
             ]
 
             groups = group_tracks(tracks)
@@ -138,7 +226,7 @@ class MusicImportPlannerTests(unittest.TestCase):
             source = root / "XO" / "03 Waltz #2.m4a"
             source.parent.mkdir(parents=True)
             source.write_bytes(b"audio")
-            track = track_from_probe(
+            track = merge_audio_tags(
                 source,
                 root,
                 probe({"artist": "Elliott Smith", "album": "XO", "date": "1998", "track": "3", "title": "Waltz #2"}),

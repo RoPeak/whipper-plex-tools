@@ -18,6 +18,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from numpy import source
+from sympy import root
+
 
 SUPPORTED_EXTENSIONS = {".flac", ".mp3", ".m4a", ".alac", ".aac", ".ogg", ".opus"}
 COVER_NAMES = {
@@ -164,14 +167,51 @@ def ffprobe_json(path: Path) -> dict[str, Any]:
         return {}
 
 
-def track_from_probe(source: Path, root: Path, probe: dict[str, Any]) -> Track:
+def merged_audio_tags(probe: dict[str, Any]) -> dict[str, Any]:
+    """Return music metadata without letting attached picture streams overwrite it"""
     tags = dict(probe.get("format", {}).get("tags", {}) or {})
+    known = {str(key).casefold() for key in tags}
     for stream in probe.get("streams", []) or []:
-        tags.update(stream.get("tags", {}) or {})
+        if stream.get("codec_type") != "audio":
+            continue
+        for key, value in (stream.get("tags", {}) or {}).items():
+            normalised = str(key).casefold()
+            if normalised not in known:
+                tags[key] = value
+                known.add(normalised)
+    return tags
+
+def disc_folder_number(path: Path, root: Path) -> int:
+    if path.parent == root:
+        return 0
+    match = re.fullmatch(r"(?:CD|Disc)\s*0*(\d+)", path.parent.name, flags=re.IGNORECASE)
+    return int(match.group(1)) if match else 0
+
+def normalise_disc_album_name(album: str, disc: int, parent_disc: int):
+    if not album or not parent_disc or disc != parent_disc:
+        return album
+    patterns = [
+        r"^(?P<album>.+?)\s+\((?P<disc>\d+)\)$",
+        r"^(?P<album>.+?)\s+\((?:CD|Disc)\s*(?P<disc>\d+)\)$",
+        r"^(?P<album>.+?)\s*[-–—]\s*(?:CD|Disc)\s*(?P<disc>\d+)$",
+    ]
+    for pattern in patterns:
+        match = re.match(pattern, album, flags=re.IGNORECASE)
+        if match and int(match.group("disc")) == parent_disc:
+            return match.group("album").strip()
+    return album
+
+def track_from_probe(source: Path, root: Path, probe: dict[str, Any]) -> Track:
+    tags = merged_audio_tags(probe)
     disc_from_name, track_from_name, title_from_name = split_filename(source)
+    parent_disc = disc_folder_number(source, root)
     rel_parts = source.relative_to(root).parts
     parent_album = rel_parts[-2] if len(rel_parts) >= 2 else ""
     parent_artist = rel_parts[-3] if len(rel_parts) >= 3 else (root.name if len(rel_parts) >= 2 else "")
+    disc_from_tag = parse_number(first_tag(tags, "disc", "discnumber"))
+    disc = disc_from_tag or parent_disc or disc_from_name or 1
+    album = first_tag(tags, "album") or parent_album
+    album = normalise_disc_album_name(album, disc, parent_disc)
 
     track = Track(
         source=source,
@@ -180,10 +220,10 @@ def track_from_probe(source: Path, root: Path, probe: dict[str, Any]) -> Track:
         title=first_tag(tags, "title") or title_from_name,
         artist=first_tag(tags, "artist", "album_artist", "albumartist") or parent_artist,
         album_artist=first_tag(tags, "album_artist", "albumartist", "album artist"),
-        album=first_tag(tags, "album") or parent_album,
+        album=album,
         year=parse_year(first_tag(tags, "date", "year")),
         track=parse_number(first_tag(tags, "track", "tracknumber")) or track_from_name,
-        disc=parse_number(first_tag(tags, "disc", "discnumber")) or disc_from_name or 1,
+        disc=disc,
         total_discs=parse_number(first_tag(tags, "disctotal", "totaldiscs")),
         genre=first_tag(tags, "genre"),
         musicbrainz_trackid=first_tag(tags, "musicbrainz_trackid", "musicbrainz/releasetrackid"),
@@ -203,7 +243,7 @@ def scan_source(root: Path) -> list[Track]:
     for index, path in enumerate(paths, 1):
         if index == 1 or index % 10 == 0 or index == len(paths):
             status(f"  ffprobe metadata: {index}/{len(paths)}")
-        tracks.append(track_from_probe(path, root, ffprobe_json(path)))
+        tracks.append(merge_audio_tags(path, root, ffprobe_json(path)))
     return tracks
 
 
