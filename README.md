@@ -1,170 +1,45 @@
-# whipper-music-tools
+# Music Ingest (Whipper Music Tools)
 
-Small Linux tools for ripping CDs with Whipper and keeping a Plex, Jellyfin, or other music-server library tidy.
+`music-ingest` is a user-run workflow for reviewing digital music and ripping audio CDs. The historical repository and `whipper-music-wizard` / `whipper-plex-wizard` commands remain supported.
 
-The main tool is `whipper-music-wizard`, an interactive Bash wizard for:
+## Install and configure
 
-- ripping CDs to FLAC with MusicBrainz metadata, cover art, and AccurateRip verification
-- importing existing digital music files without transcoding them
-- publishing music into a media-server-friendly directory layout
+The commissioned server command is installed at `~/.local/bin/music-ingest` and works from any directory. The checkout remains the source of the scripts. A TOML file at `~/.config/music-ingest/config.toml` holds paths and conservative policy:
 
-The old `bin/whipper-plex-wizard` command is still available as a compatibility wrapper.
-
-## Current Tools
-
-### `bin/whipper-music-wizard`
-
-Interactive CD ripping and digital music import wizard for Ubuntu.
-
-It helps with:
-
-- dependency checks for Whipper, FLAC tools, and digital-import metadata tools
-- CD drive selection
-- drive cache analysis
-- safe AccurateRip offset detection for Whipper 0.10.0
-- numbered MusicBrainz release selection for CDs
-- keep-going ripping so one failed track does not discard the rest of the album
-- damaged disc mode for quick salvage attempts with fewer retries per track
-- merged recovery when normal and damaged attempts salvage different tracks
-- additive repair of existing partial albums without overwriting existing tracks
-- copy-first imports from existing MP3, M4A/ALAC/AAC, OGG, OPUS, and FLAC directories
-- local tag reading, filename/folder inference, MusicBrainz search, and user confirmation for digital imports
-- media-server/exFAT-safe path sanitising before publishing
-- embedded and saved cover art where supported
-- media-server-style output:
-
-```text
-Music/Artist/Album (Year)/01 - Track Title.flac
-Music/Artist/Album (Year)/01 - Track Title.mp3
-Music/Artist/Album (Year)/01 - Track Title.m4a
+```toml
+incoming = "/srv/data/ingest/music"
+library = "/srv/data/media/Music"
+staging = "/srv/data/ingest/.music-ingest-staging"
+default_mode = "dry-run"
+publication = "copy"
+preserve_source = true
+musicbrainz_lookup = true
+multidisc_folders = false
+cover_mode = "file"
 ```
 
-Optional multi-disc layout:
+Inspect effective values with `music-ingest config`. The command refuses to create a missing production root and checks that source and library roots do not overlap. CLI options such as `--incoming`, `--library`, `--staging`, and digital `--mode` override configuration. Staging is configurable; the commissioned directory is on the same `/srv/data` ext4 filesystem as the library, avoiding large temporary media on the OS filesystem.
 
-```text
-Music/Artist/Album (Year)/CD1/01 - Track Title.flac
-```
+Runtime requirements are Python 3.11+ (standard library only), Bash, `ffprobe` (provided by FFmpeg), `flac`/`metaflac`, and standard GNU/Linux utilities. CD ripping additionally requires Whipper, `cd-paranoia`, `cdrdao`, `eject`, and access to an optical drive. The Ubuntu Whipper package supplies its Python libraries and related dependencies. Run the synthetic suite with `python3 -m unittest discover -s tests`. Artwork lookup uses Python's standard library and network requests only when explicitly requested from the cover-art menu. MusicBrainz lookup is optional and can be disabled in config.
 
-CD verification artifacts are kept under each album's hidden `.whipper/` folder. Digital import artifacts are kept under `.library-import/`.
+On RP-Server-02 the media tools are in `~/.local/opt/music-ingest-runtime`, assembled from official Ubuntu 26.04 `.deb` packages and activated by the user-level command/legacy wizard. Their exact versions are listed in `PACKAGES.txt` in that runtime. This per-user extraction does not register packages in dpkg or receive automatic OS package updates; use normal apt installation where administrator access is available and keep the inventory current when refreshing this runtime.
 
-## Requirements
+## Digital import
 
-Tested on Ubuntu with:
+Run `music-ingest`, choose digital import, and enter or accept the incoming directory. The workflow checks roots, discovers supported files, reads embedded tags and media properties with `ffprobe`, uses folder/filename evidence as fallback, groups by album artist and album, optionally searches MusicBrainz, and presents discrepancies and a review. Provider summaries include release artist/title/date, country, edition/type, media/track counts, label/catalogue/barcode when supplied, and provider/local match confidence. Equally ranked editions remain unresolved. You can edit album/track data and skip groups. It then stages copies, shows every source-to-destination mapping, and reports the proposed Jellyfin-friendly `Artist/Album (Year)` layout.
 
-- `whipper 0.10.0`
-- `flac`
-- `metaflac`
-- `ffmpeg` / `ffprobe`
-- `python3-pil`
+The default mode is `dry-run`: it leaves staged files for inspection and publishes nothing. After review, run `music-ingest digital --mode apply`; publication still requires typing `APPLY` at the final plan. Use `--incoming`, `--library`, and `--staging` for one-run path overrides. Originals are preserved. Files retain their source extension and encoded audio: lossy inputs are never converted to FLAC. Tags are not rewritten; approved metadata affects organization and the import manifest only. Existing identical files are skipped, differing conflicts block the import, and no destination is overwritten. Each copied file is staged beside its destination, size checked, then atomically linked into place without clobbering a concurrent destination.
 
-Install dependencies:
+Disc numbers are retained. Multi-disc releases use disc-prefixed track names by default (for example `2-01 - Track.mp3`) to prevent collisions while matching the existing library's flat album convention. The optional `multidisc_folders` setting uses `CD1/` folders instead. Edition, live, bonus, and instrumental identity in album/track tags and titles is retained; inspect poor tags before approval. Local cover art may be copied; remote downloads are a separate explicit action and existing covers are not replaced by default.
 
-```bash
-sudo apt update
-sudo apt install -y whipper flac ffmpeg python3-pil
-```
+Reports/manifests and retained dry-run staging are inspectable. No automatic cleanup or source deletion occurs. Remove abandoned staging only after checking its contents.
 
-## Usage
+## Audio CD workflow
 
-Run the wizard:
+Choose CD ripping from the menu or run `music-ingest cd`. The legacy Whipper wizard handles drive detection/setup, MusicBrainz release selection, secure ripping/AccurateRip where supported, cover handling, damaged-disc recovery, and additive repair. Rips stage before publication; the wizard lists every staged-to-library path and requires typing `APPLY` before publication. Declining retains the staged rip for later review. Conflicts do not overwrite existing tracks. If the drive, Whipper, or media utilities are unavailable, the CD path reports that condition and digital import remains usable. No optical-drive availability is inferred from package installation alone.
 
-```bash
-./bin/whipper-music-wizard
-```
+## Compatibility and operation
 
-Existing scripts can continue to use:
+`bin/whipper-music-wizard` and `bin/whipper-plex-wizard` remain available and activate the user-local runtime when it exists. Do not run as root. The project does not watch directories, alter Jellyfin, configure mounts, delete incoming files, or manage backups. Jellyfin sees the production media tree read-only; library discovery/playback is a separate check. Backups cover the production media tree according to the server's backup policy, not incoming files.
 
-```bash
-./bin/whipper-plex-wizard
-```
-
-First-time setup for a CD drive:
-
-1. Pick the CD drive.
-2. Run drive cache analysis.
-3. Run safe offset detection.
-4. Rip CDs.
-
-You do not need to repeat drive setup every time. Whipper saves the drive offset and cache behavior in its own config.
-
-For existing digital music, choose `Import existing digital music directory`, point the wizard at the source folder, review the inferred albums/tracks, make any corrections, and accept the import. The wizard copies into a temporary staging directory first and leaves the original source files untouched.
-
-Before a digital import publishes anything, the wizard shows the current output root and lets you enter a different library/output directory for that run. If you enter one, it is saved for future runs.
-
-MP3 and M4A files are preserved as MP3 and M4A. Converting lossy files to FLAC is technically possible, but it does not restore quality and usually only makes the files larger.
-
-The wizard prints progress while scanning files, looking up album metadata, staging output, and publishing. It also uses a small delay between major status messages so interactive runs are readable. Set `WIZARD_STEP_DELAY=0` for fast scripted runs:
-
-```bash
-WIZARD_STEP_DELAY=0 ./bin/whipper-music-wizard
-```
-
-## Safety Notes
-
-The wizard stages each rip or digital import in `/tmp` first. Before publishing, it renames staged paths to avoid characters that commonly break exFAT/Windows-compatible drives, such as `:`, `?`, `*`, `"`, `<`, `>`, `\`, and `|`. After that, it copies the staged files into your music library only if doing so will not overwrite existing files.
-
-If one or more CD tracks fail but other tracks were ripped, the wizard publishes a clearly labelled partial album, prints a completed/failed summary, and writes `.whipper/PARTIAL_RIP.txt`. This preserves useful work while making it obvious that the album still needs attention. Every rip or repair ends with a terminal session summary covering elapsed time, mode, completed tracks, failed or suspect tracks, AccurateRip counts, published files, conflicts, and any kept staging path.
-
-Digital imports use `ffprobe` readability, embedded tags, filename/folder inference, MusicBrainz search, and your confirmation as their verification flow. They do not have AccurateRip verification because they are not being read from the original CD.
-
-Digital imports are safe to rerun. Existing files with identical bytes are treated as already imported and skipped. If a destination file exists but differs, publishing stops and keeps the staged output for review.
-
-The `Download missing album covers` menu option scans album folders under your selected output root, skips albums that already have local artwork, and saves downloaded art as `cover.jpg` beside the tracks. It tries MusicBrainz/Cover Art Archive first, then falls back to Deezer album search when the primary source has no usable image. Jellyfin documents `cover.jpg` as a primary music artwork filename, and Plex supports local sidecar artwork for music libraries when local artwork is enabled/preferred.
-
-Damaged disc mode is available from the main menu. It keeps the same Whipper metadata, release selection, staging, cover-art, and publishing flow, but uses fewer retries per track so an obviously bad disc does not stall for ages. If a normal rip gives up on a track and readable FLACs were staged, the wizard can offer one automatic damaged-mode retry before publishing the partial album. Normal and damaged attempts are kept until publishing, then merged so the best available track from either attempt is used.
-
-If publishing finds an existing album marked with `.whipper/PARTIAL_RIP.txt`, the wizard treats it as a repair candidate. It adds missing FLACs and preserves new `.whipper` artefacts with attempt-specific names, but it never overwrites existing tracks automatically. If the existing album is not marked partial, publishing stops and the staged output is kept for manual review.
-
-It does not delete user music files. Temporary Whipper work directories are removed after successful or failed runs. Digital import source directories are not modified.
-
-Avoid running the wizard with `sudo`; that can create root-owned config and music files. If your user cannot read the CD device, add yourself to the `cdrom` group and log out/in:
-
-```bash
-sudo usermod -aG cdrom "$USER"
-```
-
-## Troubleshooting
-
-### Whipper offers the wrong MusicBrainz release
-
-If MusicBrainz lists several releases, do not blindly accept the suggested release. Prefer the release that matches your actual CD country, barcode, catalog number, and edition. Bootlegs and large box sets can appear in the match list.
-
-The wizard shows numbered choices and then passes the selected MusicBrainz release ID to Whipper. You should not need to type the long UUID manually. If MusicBrainz returns exactly one release, the wizard selects it automatically and shows the chosen release before ripping.
-
-### Digital import metadata looks wrong
-
-Use the import review to edit album or track metadata before accepting. The wizard reads embedded tags first, falls back to folder and filename patterns, and then searches MusicBrainz for likely release information. Messy downloads, bootlegs, singles folders, and unofficial compilations may still need human correction.
-
-Shell shortcuts such as `~/Downloads/...` are accepted in wizard path prompts. If a scan finds zero albums, double-check artist-name spelling in the path; for example `Elliot Smith` and `Elliott Smith` are different directories.
-
-### Album covers are missing
-
-Run `Download missing album covers` from the main menu after importing. The job uses stored MusicBrainz release IDs from `.library-import/IMPORT_MANIFEST.json` when available, otherwise it searches MusicBrainz from the artist, album, and year inferred from the folder path. Cover Art Archive images are saved as album-level `cover.jpg` files.
-
-Some unofficial, soundtrack-only, or bootleg-style folders may not have a MusicBrainz/Cover Art Archive cover. When a folder year appears wrong, the cover job retries the search without that year. If Cover Art Archive still fails, it searches Deezer for a strong artist/album match and uses `cover_xl`/`cover_big` artwork when available.
-
-### Cover art fetch crashes before ripping
-
-Some MusicBrainz/Cover Art Archive entries can trigger Whipper 0.10.0 network errors, including redirect loops. If that happens, the wizard offers to retry without Whipper cover-art fetching. The audio rip can still be AccurateRip-verified; artwork can be repaired later.
-
-### `eject -t` warning
-
-Some external drives do not support Whipper's tray-close command. This warning is usually harmless if ripping continues.
-
-### `cdparanoia couldn't read any frames`
-
-If Whipper retries a track several times and then gives up, it may print a `ZeroDivisionError` traceback. It can also crash while writing its final log with a `NoneType` division error after unreadable tracks. The wizard does not hide this Whipper output, but it treats these as known damaged-disc failure modes and keeps going where possible. If any FLACs were successfully created, it can retry once in damaged disc mode, merge the best tracks from each attempt, or publish/repair a clearly labelled partial album.
-
-### Very high Q sub-channel CRC errors
-
-Some damaged discs report very high Q sub-channel CRC error counts before audio ripping begins. If a track reports at least 1000 such errors, or the running total reaches 5000, the wizard warns and asks whether to stop the normal attempt and restart in damaged disc mode.
-
-## Roadmap
-
-Good next tools for this repo:
-
-- `whipper-drive-report`: summarize Whipper version, drive offset, cache behavior, and permissions
-- `music-cover-repair`: copy hidden rip/import cover art to album-level `cover.jpg` and embed missing FLAC pictures
-- `music-flac-verify`: run `flac -t` across a library
-- `whipper-rip-log-summary`: summarize AccurateRip results from `.whipper/*.log`
-- `music-library-audit`: report missing artwork, missing MusicBrainz tags, duplicate track numbers, and suspicious album folders
+See the server runbook for verified deployment paths, staging, dependencies, and recovery notes.

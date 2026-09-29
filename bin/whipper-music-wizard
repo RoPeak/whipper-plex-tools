@@ -3,12 +3,21 @@ set -euo pipefail
 IFS=$'\n\t'
 
 APP="Whipper Music Wizard"
+RUNTIME_DIR="${MUSIC_INGEST_RUNTIME:-$HOME/.local/opt/music-ingest-runtime}"
+if [[ -d "$RUNTIME_DIR/usr/bin" ]]; then
+  export PATH="$RUNTIME_DIR/usr/bin:$PATH"
+  export PYTHONPATH="$RUNTIME_DIR/usr/lib/python3/dist-packages${PYTHONPATH:+:$PYTHONPATH}"
+  export LD_LIBRARY_PATH="$RUNTIME_DIR/usr/lib/x86_64-linux-gnu:$RUNTIME_DIR/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 IMPORT_HELPER="$SCRIPT_DIR/../lib/music_import_planner.py"
-CFG_DIR="$HOME/.config/whipper-music-wizard"
-CFG_FILE="$CFG_DIR/settings.env"
-LEGACY_CFG_DIR="$HOME/.config/whipper-plex-wizard"
+# shellcheck disable=SC1091 # SCRIPT_DIR is runtime-derived; the helper is also passed to ShellCheck directly.
+source "$SCRIPT_DIR/../lib/publish.sh"
+CFG_DIR="$HOME/.config/music-ingest"
+CFG_FILE="$CFG_DIR/wizard-settings.env"
+LEGACY_CFG_DIR="$HOME/.config/whipper-music-wizard"
 LEGACY_CFG_FILE="$LEGACY_CFG_DIR/settings.env"
+OLD_LEGACY_CFG_FILE="$HOME/.config/whipper-plex-wizard/settings.env"
 mkdir -p "$CFG_DIR"
 
 # ---------- defaults ----------
@@ -59,17 +68,21 @@ cfg_is_safe() {
 load_cfg() {
   if [[ -f "$CFG_FILE" ]]; then
     if cfg_is_safe "$CFG_FILE"; then
+      # shellcheck disable=SC1090
       source "$CFG_FILE"
     else
       echo "⚠ Warning:  Ignoring unsafe or unrecognized settings file: $CFG_FILE"
     fi
-  elif [[ -f "$LEGACY_CFG_FILE" ]]; then
-    if cfg_is_safe "$LEGACY_CFG_FILE"; then
-      source "$LEGACY_CFG_FILE"
-      echo "Migrated settings from legacy config: $LEGACY_CFG_FILE"
+  elif [[ -f "$LEGACY_CFG_FILE" || -f "$OLD_LEGACY_CFG_FILE" ]]; then
+    local legacy_file="$LEGACY_CFG_FILE"
+    [[ -f "$legacy_file" ]] || legacy_file="$OLD_LEGACY_CFG_FILE"
+    if cfg_is_safe "$legacy_file"; then
+      # shellcheck disable=SC1090
+      source "$legacy_file"
+      echo "Migrated settings from legacy config: $legacy_file"
       save_cfg
     else
-      echo "⚠ Warning:  Ignoring unsafe or unrecognized legacy settings file: $LEGACY_CFG_FILE"
+      echo "⚠ Warning:  Ignoring unsafe or unrecognized legacy settings file: $legacy_file"
     fi
   fi
 }
@@ -107,8 +120,8 @@ expand_user_path() {
   local path="$1"
   if [[ "$path" == "~" ]]; then
     printf '%s\n' "$HOME"
-  elif [[ "$path" == "~/"* ]]; then
-    printf '%s/%s\n' "$HOME" "${path#"~/"}"
+  elif [[ "${path:0:1}" == "~" && "${path:1:1}" == "/" ]]; then
+    printf '%s/%s\n' "$HOME" "${path:2}"
   else
     printf '%s\n' "$path"
   fi
@@ -420,25 +433,19 @@ ensure_digital_import_deps() {
     return 0
   fi
 
-  echo "Missing packages: ${missing[*]}"
-  read -rp "Install them now with apt (requires sudo)? [y/N] " yn
-  if is_yes "$yn"; then
-    if sudo apt update && sudo apt install -y ffmpeg python3; then
-      echo "✔ Success: Installed."
-    else
-      echo "✘ Fail: Package install failed. Check the apt output above."
-      return 1
-    fi
-  else
-    echo "Skipping install. You can install later with:"
-    echo "  sudo apt update && sudo apt install -y ffmpeg python3"
-    return 1
-  fi
+  echo "Digital import is unavailable; missing runtime package(s): ${missing[*]}"
+  echo "Install the verified Ubuntu packages with administrator access, then retry."
+  return 1
 }
 
 choose_output_root_for_job() {
   local label="$1"
   local v
+
+  if [[ -n "${MUSIC_INGEST_ACTION:-}" ]]; then
+    echo "$label output directory: $OUT_ROOT (use --library to override for this run)"
+    return 0
+  fi
 
   echo
   echo "$label output directory:"
@@ -1190,7 +1197,7 @@ print_session_summary() {
   fi
   if [[ -n "${kept_paths:-}" ]]; then
     echo "  Kept staging paths:"
-    printf '    %s\n' $kept_paths
+    while IFS= read -r kept_path; do [[ -n "$kept_path" ]] && printf '    %s\n' "$kept_path"; done <<< "$kept_paths"
   fi
 }
 
@@ -1222,6 +1229,7 @@ publish_staged_output() {
       echo
       echo "Existing partial album found; repairing additively without overwriting files:"
       echo "  $partial_album"
+      confirm_publish_plan "$stage" "$dest" "Additive CD repair" "${files[@]}" || return 1
       stamp="$(date +%Y%m%d-%H%M%S)"
       for src in "${files[@]}"; do
         rel="${src#"$stage"/}"
@@ -1230,7 +1238,7 @@ publish_staged_output() {
           if [[ "$rel" == */.whipper/* && "$rel" != */.whipper/cover.* ]]; then
             repair_target="$(conflict_safe_path "$target" "$stamp")"
             mkdir -p "$(dirname "$repair_target")"
-            cp -p -- "$src" "$repair_target"
+            publish_file_atomic "$src" "$repair_target" || return 1
             ((copied += 1))
           else
             ((skipped += 1))
@@ -1238,7 +1246,7 @@ publish_staged_output() {
           continue
         fi
         mkdir -p "$(dirname "$target")"
-        cp -p -- "$src" "$target"
+        publish_file_atomic "$src" "$target" || return 1
         ((copied += 1))
       done
       SESSION_PUBLISHED_FILES=$((SESSION_PUBLISHED_FILES + copied))
@@ -1258,11 +1266,12 @@ publish_staged_output() {
     return 1
   fi
 
+  confirm_publish_plan "$stage" "$dest" "CD rip" "${files[@]}" || return 1
   for src in "${files[@]}"; do
     rel="${src#"$stage"/}"
     target="$dest/$rel"
     mkdir -p "$(dirname "$target")"
-    cp -p -- "$src" "$target"
+    publish_file_atomic "$src" "$target" || return 1
     ((copied += 1))
   done
 
@@ -1328,7 +1337,7 @@ publish_digital_import_output() {
       continue
     fi
     mkdir -p "$(dirname "$target")"
-    cp -p -- "$src" "$target"
+    publish_file_atomic "$src" "$target" || return 1
     ((copied += 1))
   done
 
@@ -1483,7 +1492,6 @@ publish_partial_rip_if_any() {
     return 0
   fi
 
-  stage_out=""
   return 1
 }
 
@@ -1520,13 +1528,13 @@ rip_cd() {
   cleanup_rip_tmp() {
     local path keep
     for path in "${work_dirs[@]:-}"; do
-      [[ -n "$path" && "$path" == /tmp/whipper-work-* ]] && rm -rf -- "$path"
+      [[ -n "$path" && "${path##*/}" == whipper-work-* ]] && rm -rf -- "$path"
     done
     for path in "${attempt_logs[@]:-}" "$merged_log"; do
       [[ -n "$path" ]] && rm -f -- "$path"
     done
     for path in "${attempt_stages[@]:-}" "$merged_stage"; do
-      [[ -n "$path" && "$path" == /tmp/whipper-out-* ]] || continue
+      [[ -n "$path" && "${path##*/}" == whipper-out-* ]] || continue
       keep="no"
       if [[ -n "${kept_paths:-}" ]]; then
         while IFS= read -r kept; do
@@ -1783,6 +1791,28 @@ rip_cd() {
   return 0
 }
 
+write_digital_report() {
+  local result="$1" outcome="$2" stage="$3"
+  local report_dir="${XDG_STATE_HOME:-$HOME/.local/state}/music-ingest/reports"
+  mkdir -p "$report_dir" || { echo "Warning: could not create report directory $report_dir"; return 0; }
+  python3 - "$result" "$report_dir" "$outcome" "$stage" "${SESSION_PUBLISHED_FILES:-0}" "${SESSION_CONFLICTS:-0}" <<'PYREPORT'
+import json, sys, time
+from pathlib import Path
+source, directory, outcome, stage = sys.argv[1:5]
+data = json.loads(Path(source).read_text(encoding="utf-8"))
+data["outcome"] = outcome
+data["staging"] = stage
+data["source_lifecycle"] = "preserved"
+data["published_file_count"] = int(sys.argv[5])
+data["existing_or_conflicting_file_count"] = int(sys.argv[6])
+data["verification"] = "ffprobe readability and staged/source size match are recorded per track; published copy size is checked; full-file hashes are not computed"
+data["reported_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+target = Path(directory) / f"music-ingest-{time.strftime('%Y%m%d-%H%M%S')}-{__import__('os').getpid()}.json"
+target.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+print(f"Report: {target}")
+PYREPORT
+}
+
 import_digital_music() {
   ensure_digital_import_deps || return 1
   mkdir -p "$OUT_ROOT"
@@ -1793,7 +1823,8 @@ import_digital_music() {
   start_time="$(date +%s)"
 
   echo
-  read -rp "Path to digital music directory: " source
+  read -rp "Path to digital music directory [${MUSIC_INGEST_INCOMING:-}]: " source
+  source="${source:-${MUSIC_INGEST_INCOMING:-}}"
   source="$(expand_user_path "$source")"
   if [[ -z "${source:-}" ]]; then
     echo "No source path entered."
@@ -1821,7 +1852,7 @@ import_digital_music() {
 
   cleanup_import_tmp() {
     [[ -n "${result:-}" && -f "$result" ]] && rm -f -- "$result"
-    if [[ -n "${stage:-}" && "$stage" == /tmp/music-import-out-* && -z "${kept_paths:-}" ]]; then
+    if [[ -n "${stage:-}" && "${stage##*/}" == music-import-out-* && -z "${kept_paths:-}" ]]; then
       rm -rf -- "$stage"
     fi
   }
@@ -1846,7 +1877,8 @@ import_digital_music() {
     --library-root "$OUT_ROOT" \
     --multidisc "$MULTIDISC" \
     --include-track-artist "$INCLUDE_TRACK_ARTIST" \
-    --lookup yes \
+    --lookup "${MUSIC_INGEST_LOOKUP:-yes}" \
+    --mode "${MUSIC_INGEST_MODE:-dry-run}" \
     --delay "$WIZARD_STEP_DELAY" \
     --result-file "$result"; then
     status="digital import aborted"
@@ -1869,6 +1901,26 @@ import_digital_music() {
     postprocess_cover_art "${dirs[@]}"
   fi
 
+  if [[ "${MUSIC_INGEST_MODE:-dry-run}" == "dry-run" ]]; then
+    echo "Dry run complete. Nothing was published. Review the mapping above and rerun with: music-ingest digital --mode apply"
+    kept_paths="$stage"
+    status="digital import dry-run"
+    write_digital_report "$result" "$status" "$stage"
+    print_digital_import_summary "$start_time" "$status" "$stage" "$result" "$kept_paths"
+    return 0
+  fi
+  if ! python3 - "$result" <<'PYAPPROVAL'
+import json, sys
+from pathlib import Path
+raise SystemExit(0 if json.loads(Path(sys.argv[1]).read_text(encoding="utf-8")).get("approved_to_publish") else 1)
+PYAPPROVAL
+  then
+    kept_paths="$stage"
+    status="digital import declined"
+    write_digital_report "$result" "$status" "$stage"
+    return 0
+  fi
+
   say_status "Publishing staged digital import into library..."
   if publish_digital_import_output "$stage" "$OUT_ROOT"; then
     status="digital import published"
@@ -1879,6 +1931,7 @@ import_digital_music() {
     echo "   No cleanup touched your music directory or source directory."
   fi
 
+  write_digital_report "$result" "$status" "$stage"
   print_digital_import_summary "$start_time" "$status" "$stage" "$result" "$kept_paths"
   [[ "$status" == "digital import published" ]] || return 1
   return 0
@@ -1949,7 +2002,7 @@ PY
   fi
   if [[ -n "${kept_paths:-}" ]]; then
     echo "  Kept staging paths:"
-    printf '    %s\n' $kept_paths
+    while IFS= read -r kept_path; do [[ -n "$kept_path" ]] && printf '    %s\n' "$kept_path"; done <<< "$kept_paths"
   fi
 }
 
@@ -1972,7 +2025,7 @@ repair_staged_partial() {
     echo "✘ Fail: Not a directory - $stage"
     return 1
   fi
-  if [[ "$stage" != /tmp/whipper-out-* ]]; then
+  if [[ "${stage##*/}" != whipper-out-* ]]; then
     echo "⚠ Warning:  This is not a usual wizard staging path:"
     echo "  $stage"
     read -rp "Continue anyway? [y/N] " yn
@@ -2057,7 +2110,18 @@ main_menu() {
 }
 
 load_cfg
+OUT_ROOT="${MUSIC_INGEST_LIBRARY:-$OUT_ROOT}"
+MULTIDISC="${MUSIC_INGEST_MULTIDISC:-$MULTIDISC}"
+COVER_MODE="${MUSIC_INGEST_COVER_MODE:-$COVER_MODE}"
+if [[ -n "${MUSIC_INGEST_STAGING:-}" ]]; then
+  mkdir -p "$MUSIC_INGEST_STAGING"
+  export TMPDIR="$MUSIC_INGEST_STAGING"
+fi
 KEEP_GOING="yes"
+case "${MUSIC_INGEST_ACTION:-}" in
+  digital) rc=0; import_digital_music || rc=$?; exit "$rc" ;;
+  cd) rc=0; rip_cd || rc=$?; exit "$rc" ;;
+esac
 while true; do
   main_menu
 done

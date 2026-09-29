@@ -61,6 +61,14 @@ class Track:
     has_embedded_art: bool = False
     readable: bool = False
     proposed_rel: str = ""
+    folder_artist_hint: str = ""
+    folder_album_hint: str = ""
+    embedded_artist: str = ""
+    embedded_album: str = ""
+    codec: str = ""
+    bitrate: int = 0
+    sample_rate: int = 0
+    compilation: bool = False
 
 
 @dataclass
@@ -248,8 +256,8 @@ def track_from_probe(source: Path, root: Path, probe: dict[str, Any]) -> Track:
     disc_from_name, track_from_name, title_from_name = split_filename(source)
     parent_disc = disc_folder_number(source, root)
     rel_parts = source.relative_to(root).parts
-    parent_album = rel_parts[-2] if len(rel_parts) >= 2 else ""
-    parent_artist = rel_parts[-3] if len(rel_parts) >= 3 else (root.name if len(rel_parts) >= 2 else "")
+    parent_album = rel_parts[-3] if parent_disc and len(rel_parts) >= 3 else (rel_parts[-2] if len(rel_parts) >= 2 else "")
+    parent_artist = (rel_parts[-4] if len(rel_parts) >= 4 else root.name) if parent_disc else (rel_parts[-3] if len(rel_parts) >= 3 else (root.name if len(rel_parts) >= 2 else ""))
     artist = first_tag(tags, "artist", "album_artist", "albumartist") or parent_artist
     year = parse_year(first_tag(tags, "date", "year"))
     disc_from_tag = parse_number(first_tag(tags, "disc", "discnumber"))
@@ -258,6 +266,16 @@ def track_from_probe(source: Path, root: Path, probe: dict[str, Any]) -> Track:
     container_album = album_container_name(source, root, artist, year) if parent_disc else ""
     album = normalise_disc_album_name(album, disc, parent_disc, container_album)
 
+    audio_stream = next((stream for stream in (probe.get("streams", []) or []) if stream.get("codec_type") == "audio"), {})
+    try:
+        bitrate = int(probe.get("format", {}).get("bit_rate") or audio_stream.get("bit_rate") or 0)
+    except (TypeError, ValueError):
+        bitrate = 0
+    try:
+        sample_rate = int(audio_stream.get("sample_rate") or 0)
+    except (TypeError, ValueError):
+        sample_rate = 0
+    compilation_value = first_tag(tags, "compilation", "cpil").casefold()
     track = Track(
         source=source,
         rel_source=str(source.relative_to(root)),
@@ -275,6 +293,14 @@ def track_from_probe(source: Path, root: Path, probe: dict[str, Any]) -> Track:
         musicbrainz_releaseid=first_tag(tags, "musicbrainz_albumid", "musicbrainz_releaseid"),
         has_embedded_art=any((s.get("codec_type") == "video" and s.get("disposition", {}).get("attached_pic")) for s in probe.get("streams", []) or []),
         readable=bool(probe),
+        folder_artist_hint=(rel_parts[-4] if len(rel_parts) >= 4 else "") if parent_disc else (rel_parts[-3] if len(rel_parts) >= 3 else ""),
+        folder_album_hint=container_album or parent_album,
+        embedded_artist=first_tag(tags, "album_artist", "albumartist", "album artist", "artist"),
+        embedded_album=first_tag(tags, "album"),
+        codec=str(audio_stream.get("codec_name") or source.suffix.lower().lstrip(".")),
+        bitrate=bitrate,
+        sample_rate=sample_rate,
+        compilation=compilation_value in {"1", "true", "yes", "compilation"},
     )
     if not track.album_artist:
         track.album_artist = track.artist
@@ -466,10 +492,33 @@ def print_review(groups: list[AlbumGroup], library_root: Path, multidisc: bool, 
         )
         prefix = "SKIP " if group.skip else ""
         print(f"{idx}) {prefix}{group.album_artist} - {group.album} ({group.year or 'year unknown'})")
+        codec_names = ", ".join(sorted({track.codec for track in group.tracks if track.codec})) or "unknown"
+        bitrates = sorted({track.bitrate for track in group.tracks if track.bitrate})
+        sample_rates = sorted({track.sample_rate for track in group.tracks if track.sample_rate})
+        audio_detail = f"   Audio  : {codec_names}"
+        if bitrates:
+            audio_detail += ", " + "/".join(f"{rate // 1000} kb/s" for rate in bitrates)
+        if sample_rates:
+            audio_detail += ", " + "/".join(f"{rate} Hz" for rate in sample_rates)
         print(f"   Tracks : {len(group.tracks)}   Formats: {formats}")
+        print(audio_detail)
+        if any(track.compilation for track in group.tracks):
+            print("   Type   : compilation flag present")
         print(f"   Match  : {group.match_status}")
         print(f"   Missing: {', '.join(missing) if missing else 'none'}")
         print(f"   Dest   : {library_root / proposed_album_dir(group)}")
+        discrepancies = []
+        for track in group.tracks:
+            if track.embedded_artist and track.folder_artist_hint and track.embedded_artist.casefold() != track.folder_artist_hint.casefold():
+                discrepancies.append(f"{track.rel_source}: tagged artist '{track.embedded_artist}' vs folder '{track.folder_artist_hint}'")
+            if track.embedded_album and track.folder_album_hint and track.embedded_album.casefold() != track.folder_album_hint.casefold():
+                discrepancies.append(f"{track.rel_source}: tagged album '{track.embedded_album}' vs folder '{track.folder_album_hint}'")
+        if discrepancies:
+            print("   Tag/path differences to review:")
+            for note in discrepancies[:8]:
+                print(f"     {note}")
+            if len(discrepancies) > 8:
+                print(f"     ... and {len(discrepancies) - 8} more")
 
 
 def edit_album(group: AlbumGroup) -> None:
@@ -556,7 +605,24 @@ def stage_import(groups: list[AlbumGroup], stage: Path, source_root: Path, multi
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(track.source, target)
             copied += 1
-            album_tracks.append({"source": track.rel_source, "destination": track.proposed_rel, "readable": track.readable})
+            source_size = track.source.stat().st_size
+            staged_size = target.stat().st_size
+            album_tracks.append({
+                "source": track.rel_source,
+                "destination": track.proposed_rel,
+                "readable": track.readable,
+                "source_size_bytes": source_size,
+                "staged_size_bytes": staged_size,
+                "verified_size_match": source_size == staged_size,
+                "embedded_artist": track.embedded_artist,
+                "folder_artist_hint": track.folder_artist_hint,
+                "embedded_album": track.embedded_album,
+                "folder_album_hint": track.folder_album_hint,
+                "codec": track.codec,
+                "bitrate": track.bitrate,
+                "sample_rate": track.sample_rate,
+                "compilation": track.compilation,
+            })
         copy_album_cover(source_root, group, album_dir, artifact_dir)
         albums.append(
             {
@@ -652,6 +718,69 @@ def album_info_from_dir(album_dir: Path, library_root: Path) -> dict[str, str]:
     return {"album_artist": artist, "album": album, "year": year, "musicbrainz_releaseid": "", "musicbrainz_releasegroupid": ""}
 
 
+def musicbrainz_release_details(release: dict[str, Any], local_score: int) -> str:
+    artist_credit = release.get("artist-credit") or release.get("artist_credit") or []
+    artists = []
+    for item in artist_credit:
+        if isinstance(item, dict):
+            artist = item.get("artist") or {}
+            artists.append(str(item.get("name") or artist.get("name") or ""))
+        elif isinstance(item, str):
+            artists.append(item)
+    details = ["artist " + "".join(artists).strip() if artists else "artist unknown"]
+    details.append("title " + str(release.get("title") or "unknown"))
+    if release.get("date"):
+        details.append("date " + str(release["date"]))
+    if release.get("country"):
+        details.append("country " + str(release["country"]))
+    release_group = release.get("release-group") or release.get("release_group") or {}
+    release_types = []
+    if isinstance(release_group, dict):
+        if release_group.get("primary-type") or release_group.get("primary_type"):
+            release_types.append(str(release_group.get("primary-type") or release_group.get("primary_type")))
+        secondary = release_group.get("secondary-types") or release_group.get("secondary_types") or []
+        release_types.extend(str(value) for value in secondary)
+    if release_types:
+        details.append("type " + "/".join(release_types))
+    edition = [str(value) for value in (release.get("disambiguation"), release.get("packaging")) if value]
+    if edition:
+        details.append("edition " + ", ".join(edition))
+    media = release.get("media") or []
+    media_count = release.get("media-count") or release.get("media_count") or (len(media) if media else 0)
+    track_count = release.get("track-count") or release.get("track_count") or sum(
+        int(m.get("track-count") or m.get("track_count") or 0) for m in media if isinstance(m, dict)
+    )
+    if media_count:
+        details.append(f"{media_count} disc(s)")
+    if track_count:
+        details.append(f"{track_count} track(s)")
+    labels = []
+    catalogue_numbers = []
+    for info in release.get("label-info") or release.get("label_info") or []:
+        if not isinstance(info, dict):
+            continue
+        label = info.get("label") or {}
+        if isinstance(label, dict) and label.get("name"):
+            labels.append(str(label["name"]))
+        if info.get("catalog-number") or info.get("catalog_number"):
+            catalogue_numbers.append(str(info.get("catalog-number") or info.get("catalog_number")))
+    if release.get("label") and not labels:
+        labels.append(str(release["label"]))
+    if release.get("catno") and not catalogue_numbers:
+        catalogue_numbers.append(str(release["catno"]))
+    if labels:
+        details.append("label " + ", ".join(dict.fromkeys(labels)))
+    if catalogue_numbers:
+        details.append("catalogue " + ", ".join(dict.fromkeys(catalogue_numbers)))
+    if release.get("barcode"):
+        details.append("barcode " + str(release["barcode"]))
+    provider_score = release.get("score")
+    if provider_score is not None:
+        details.append(f"MusicBrainz confidence {provider_score}/100")
+    details.append(f"local match {local_score}/10")
+    return "; ".join(details)
+
+
 def find_musicbrainz_release(album_artist: str, album: str, year: str, last_request: float) -> tuple[str, str, str, float]:
     if not album or album == "Unknown Album":
         return "", "", "not enough metadata", last_request
@@ -678,13 +807,19 @@ def find_musicbrainz_release(album_artist: str, album: str, year: str, last_requ
         if not releases:
             last_status = "no MusicBrainz match"
             continue
-        best = max(releases, key=lambda r: release_score(group, r))
-        if release_score(group, best) < 4:
-            last_status = "weak MusicBrainz match ignored"
+        ranked = sorted(releases, key=lambda r: release_score(group, r), reverse=True)
+        best_score = release_score(group, ranked[0])
+        if best_score < 8:
+            last_status = "weak MusicBrainz match ignored; exact title and artist evidence required"
             continue
-        status_text = "MusicBrainz candidate"
+        tied = [release for release in ranked if release_score(group, release) == best_score]
+        if len(tied) > 1:
+            summaries = [musicbrainz_release_details(release, best_score) for release in tied[:5]]
+            return "", "", f"ambiguous MusicBrainz editions; review candidates: {' | '.join(summaries)}", last_request
+        best = tied[0]
+        status_text = "unique MusicBrainz candidate; " + musicbrainz_release_details(best, best_score)
         if year and not attempt_year:
-            status_text = "MusicBrainz candidate after retry without folder year"
+            status_text = "MusicBrainz candidate after retry without folder year; " + musicbrainz_release_details(best, best_score)
         return str(best.get("id") or ""), release_group_id(best), status_text, last_request
     return "", "", last_status, last_request
 
@@ -898,6 +1033,23 @@ def cmd_import(args: argparse.Namespace) -> int:
         print("Import aborted before staging.")
         return 4
     manifest = stage_import(groups, stage, source, args.multidisc == "yes", args.include_track_artist == "yes")
+    print("\nSafe publication plan (source -> destination):")
+    for album in manifest["albums"]:
+        album_name = f'{album["album"]} ({album["year"]})' if album.get("year") else album["album"]
+        print(f'  {album["album_artist"]} - {album_name}; {len(album["tracks"])} track(s)')
+        print(f'    MusicBrainz: {album["match_status"]}')
+        for track in album["tracks"]:
+            print(f'    {source / track["source"]} -> {library_root / track["destination"]}')
+    approved = False
+    if args.mode == "apply" and manifest["copied_tracks"]:
+        try:
+            approved = input("Type APPLY to publish these staged copies (anything else cancels): ").strip() == "APPLY"
+        except (EOFError, KeyboardInterrupt):
+            approved = False
+        if not approved:
+            print(f"Publication cancelled. Staged files remain at: {stage}")
+    manifest["mode"] = args.mode
+    manifest["approved_to_publish"] = approved
     Path(args.result_file).write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     print(f"Staged {manifest['copied_tracks']} digital track(s) in: {stage}")
     if manifest["skipped_tracks"]:
@@ -915,6 +1067,7 @@ def build_parser() -> argparse.ArgumentParser:
     importer.add_argument("--multidisc", choices=["yes", "no"], default="no")
     importer.add_argument("--include-track-artist", choices=["yes", "no"], default="no")
     importer.add_argument("--lookup", choices=["yes", "no"], default="yes")
+    importer.add_argument("--mode", choices=["dry-run", "apply"], default="dry-run")
     importer.add_argument("--delay", type=float, default=0.0)
     importer.add_argument("--result-file", required=True)
     importer.set_defaults(func=cmd_import)
@@ -929,7 +1082,16 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except (EOFError, KeyboardInterrupt):
+        print("Import cancelled; nothing was published.")
+        return 4
+    except Exception as exc:
+        if os.environ.get("MUSIC_INGEST_DEBUG") == "1":
+            raise
+        print(f"music-ingest: import failed: {exc} (set MUSIC_INGEST_DEBUG=1 for traceback)", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

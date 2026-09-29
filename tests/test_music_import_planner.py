@@ -59,6 +59,22 @@ class MusicImportPlannerTests(unittest.TestCase):
             self.assertEqual(track.year, "1997")
             self.assertEqual(track.track, 1)
 
+    def test_audio_properties_and_compilation_flag_are_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "Greatest Hits" / "01 - Song.mp3"
+            path.parent.mkdir()
+            path.write_bytes(b"fixture")
+            metadata = {
+                "format": {"tags": {"artist": "Various Artists", "album": "Greatest Hits", "compilation": "1"}, "bit_rate": "320000"},
+                "streams": [{"codec_type": "audio", "codec_name": "mp3", "sample_rate": "44100"}],
+            }
+            track = track_from_probe(path, root, metadata)
+        self.assertEqual(track.codec, "mp3")
+        self.assertEqual(track.bitrate, 320000)
+        self.assertEqual(track.sample_rate, 44100)
+        self.assertTrue(track.compilation)
+
     def test_attached_picture_stream_does_not_overwrite_tags(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -410,8 +426,14 @@ class MusicImportPlannerTests(unittest.TestCase):
                         "id": "release-id",
                         "title": "New Moon",
                         "date": "2007",
+                        "country": "US",
+                        "score": 100,
+                        "media-count": 2,
+                        "track-count": 24,
+                        "packaging": "Jewel Case",
+                        "label-info": [{"catalog-number": "LC-2007", "label": {"name": "Example Records"}}],
                         "artist-credit": [{"name": "Elliott Smith"}],
-                        "release-group": {"id": "group-id"},
+                        "release-group": {"id": "group-id", "primary-type": "Album", "secondary-types": ["Compilation"]},
                     }
                 ]
             },
@@ -422,7 +444,32 @@ class MusicImportPlannerTests(unittest.TestCase):
 
         self.assertEqual(release_id, "release-id")
         self.assertEqual(group_id, "group-id")
-        self.assertEqual(status, "MusicBrainz candidate after retry without folder year")
+        self.assertIn("MusicBrainz candidate after retry without folder year", status)
+        self.assertIn("Elliott Smith", status)
+        self.assertIn("country US", status)
+        self.assertIn("2 disc(s)", status)
+        self.assertIn("24 track(s)", status)
+        self.assertIn("Example Records", status)
+        self.assertIn("local match 8/10", status)
+
+    def test_ambiguous_musicbrainz_editions_are_not_auto_selected(self):
+        releases = [
+            {"id": "edition-a", "score": 100, "title": "Born to Run", "date": "1975-08-25", "country": "US", "barcode": "111", "packaging": "Jewel Case", "media-count": 1, "track-count": 8, "label-info": [{"catalog-number": "PC 33795", "label": {"name": "Columbia"}}], "release-group": {"primary-type": "Album"}, "artist-credit": [{"name": "Bruce Springsteen"}]},
+            {"id": "edition-b", "score": 96, "title": "Born to Run", "date": "2005-11-15", "country": "US", "barcode": "222", "disambiguation": "30th anniversary edition", "media-count": 2, "track-count": 16, "artist-credit": [{"name": "Bruce Springsteen"}]},
+        ]
+        with patch("lib.music_import_planner.musicbrainz_json", return_value={"releases": releases}), patch(
+            "lib.music_import_planner.wait_for_musicbrainz", return_value=1.0
+        ):
+            release_id, _group_id, status, _last_request = find_musicbrainz_release("Bruce Springsteen", "Born to Run", "", 0.0)
+        self.assertEqual(release_id, "")
+        self.assertIn("ambiguous MusicBrainz editions", status)
+        self.assertIn("1975-08-25", status)
+        self.assertIn("2005-11-15", status)
+        self.assertIn("Bruce Springsteen", status)
+        self.assertIn("30th anniversary edition", status)
+        self.assertIn("PC 33795", status)
+        self.assertIn("8 track(s)", status)
+        self.assertIn("MusicBrainz confidence 100/100", status)
 
     def test_download_cover_falls_back_to_release_group(self):
         target = Path(tempfile.mkdtemp()) / "cover.jpg"
