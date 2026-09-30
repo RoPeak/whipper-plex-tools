@@ -102,7 +102,8 @@ def staging_command(config: dict[str, object], action: str) -> int:
 
 
 def run_action(
-    action: str, config: dict[str, object], mode: str | None = None, device: Path | None = None
+    action: str, config: dict[str, object], mode: str | None = None, device: Path | None = None,
+    allow_cdr: bool = False,
 ) -> int:
     if action == "cd":
         if not shutil.which("whipper"):
@@ -145,6 +146,9 @@ def run_action(
         # The device is an operator-selected hint for the CD-only wizard. It is
         # intentionally not persisted: a replacement drive needs recommissioning.
         env["MUSIC_INGEST_DEVICE"] = str(device)
+    # Explicit one-session intent only.  Never persist permission for future discs.
+    if allow_cdr:
+        env["MUSIC_INGEST_ALLOW_CDR"] = "yes"
     return subprocess.run([str(WIZARD)], env=env, check=False).returncode
 
 
@@ -195,6 +199,7 @@ def build_parser() -> argparse.ArgumentParser:
     cd = sub.add_parser("cd", help="start the Whipper CD workflow")
     add_path_overrides(cd)
     cd.add_argument("--device", type=Path, help="use this optical device for this CD session only")
+    cd.add_argument("--allow-cdr", action="store_true", help="explicitly permit Whipper's CD-R mode for this session")
     staging = sub.add_parser("staging", help="inspect or safely clean tool-owned staging")
     staging.add_argument("action", choices=("status", "cleanup"), nargs="?", default="status")
     add_path_overrides(staging)
@@ -218,7 +223,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "digital":
             return run_action("digital", config, args.mode)
         if args.command == "cd":
-            return run_action("cd", config, "apply", args.device)
+            return run_action("cd", config, "apply", args.device, args.allow_cdr)
         if args.command == "staging":
             return staging_command(config, args.action)
         return wizard(config)

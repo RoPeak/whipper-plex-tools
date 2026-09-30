@@ -1595,15 +1595,20 @@ rip_cd() {
     local log_file="$1"
     local allow_prompt="$2"
     shift 2
-    local line status pid yn
+    local line status pid yn pipe
     local q_errors q_track q_total=0 q_prompted="no"
     BAD_DISC_ABORTED="no"
     : > "$log_file"
 
+    # Do not use a named coprocess here.  Bash unsets its WPW_RIP array when a
+    # short-lived backend exits; under `set -u` that turned a normal Whipper
+    # rejection into an operator-facing "unbound variable" crash.
+    pipe="$(mktemp -u "${TMPDIR:-/tmp}/whipper-output-XXXXXX")"
+    mkfifo -- "$pipe"
     set +e
-    coproc WPW_RIP { "$@" 2>&1; }
-    pid="$WPW_RIP_PID"
-    while IFS= read -r line <&"${WPW_RIP[0]}"; do
+    "$@" >"$pipe" 2>&1 &
+    pid=$!
+    while IFS= read -r line < "$pipe"; do
       printf '%s\n' "$line" | tee -a "$log_file"
       if [[ "$allow_prompt" == "yes" && "$q_prompted" == "no" && "$line" =~ Track[[:space:]]+([0-9]+)[[:space:]]+finished,[[:space:]]+found[[:space:]]+([0-9]+)[[:space:]]+Q[[:space:]]sub-channels[[:space:]]with[[:space:]]CRC[[:space:]]errors ]]; then
         q_track="${BASH_REMATCH[1]}"
@@ -1629,6 +1634,7 @@ rip_cd() {
     wait "$pid"
     status=$?
     set -e
+    rm -f -- "$pipe"
     return "$status"
   }
 
@@ -1638,7 +1644,11 @@ rip_cd() {
     local stage work log retry_limit allow_bad_disc_prompt status
     local args=()
 
-    stage="$(mktemp -d -t whipper-out-XXXXXX)"
+    # A successful rip is an Incoming source, not an opaque production-side
+    # temporary.  It is deliberately retained after COPY publication for the
+    # independent ingest-cleanup provenance boundary.
+    mkdir -p -- "${MUSIC_INGEST_INCOMING:?MUSIC_INGEST_INCOMING is required}"
+    stage="$(mktemp -d "${MUSIC_INGEST_INCOMING%/}/whipper-out-XXXXXX")"
     work="$(mktemp -d -t whipper-work-XXXXXX)"
     log="$(mktemp -t whipper-run-XXXXXX.log)"
     attempt_stages+=("$stage")
@@ -1668,6 +1678,7 @@ rip_cd() {
       args+=(--prompt)
     fi
     [[ "$ALLOW_UNKNOWN" == "yes" ]] && args+=(--unknown)
+    [[ "${MUSIC_INGEST_ALLOW_CDR:-no}" == "yes" ]] && args+=(--cdr)
     args+=(--keep-going)
 
     release_modes="${release_modes:+$release_modes, }$mode"
@@ -1726,6 +1737,21 @@ rip_cd() {
           else
             rc=$?
           fi
+        fi
+      fi
+
+      if [[ "$rc" -ne 0 && "${MUSIC_INGEST_ALLOW_CDR:-no}" != "yes" ]] && grep -qi 'seems to be a CD-R.*--cdr' "$final_log"; then
+        echo
+        echo 'Whipper reports this medium as a recordable CD (CD-R).'
+        echo 'Is this actually a CD-R / burned audio disc?'
+        if [[ -r /dev/tty ]] && read -rp '[Y] Yes, allow CD-R ripping; [N] No, stop and show diagnostics: ' yn </dev/tty && is_yes "${yn:-}"; then
+          echo "Retrying with Whipper's explicit --cdr permission."
+          MUSIC_INGEST_ALLOW_CDR=yes
+          retry_outcome='CD-R explicitly approved; retry attempted'
+          if run_attempt "$COVER_MODE" normal; then rc=0; else rc=$?; fi
+        else
+          echo 'CD rip did not start. Whipper reported CD-R media; no audio files were written.'
+          echo "Diagnostic log: $final_log"
         fi
       fi
 
@@ -1797,6 +1823,7 @@ rip_cd() {
   echo "Publishing staged rip into library..."
   if publish_staged_output "$final_stage" "$OUT_ROOT"; then
     final_status="published"
+    kept_paths="$final_stage"
     echo
     if rip_log_has_failed_tracks "$final_log"; then
       echo "⚠ Warning: Done, but this is a PARTIAL album. Re-rip this CD later to replace/complete missing tracks."

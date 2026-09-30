@@ -9,6 +9,10 @@ from lib import music_ingest
 
 
 class MusicIngestConfigTests(unittest.TestCase):
+    def test_cd_allow_cdr_is_explicit_session_option(self):
+        args = music_ingest.build_parser().parse_args(["cd", "--allow-cdr"])
+        self.assertTrue(args.allow_cdr)
+
     def test_path_overrides_work_before_or_after_subcommand(self):
         parser = music_ingest.build_parser()
         before = parser.parse_args(["--library", "/tmp/before", "digital"])
