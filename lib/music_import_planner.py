@@ -86,6 +86,7 @@ class AlbumGroup:
     edition_clues: list[str] = field(default_factory=list)
     provider_candidates: list[dict[str, Any]] = field(default_factory=list)
     skip: bool = False
+    artwork: dict[str, str] = field(default_factory=dict)
 
 
 def sanitize_component(name: str) -> str:
@@ -604,6 +605,9 @@ def print_review(groups: list[AlbumGroup], library_root: Path, multidisc: bool, 
         print(f"   Metadata: {group.match_status}")
         print(f"   Missing: {', '.join(missing) if missing else 'none'}")
         print(f"   Dest   : {library_root / proposed_album_dir(group)}")
+        artwork = describe_artwork(group, library_root)
+        print(f"   Artwork: {artwork['label']}")
+        print(f"   Art dest: {artwork['destination']}")
         discrepancies = grouped_discrepancies(group)
         for label, folder_value, tag_value, affected in discrepancies:
             print(f"   Folder/tag discrepancy ({affected}/{len(group.tracks)}):")
@@ -756,8 +760,9 @@ def stage_import(
                 "sample_rate": track.sample_rate,
                 "compilation": track.compilation,
             })
+        artwork = describe_artwork(group, library_root or stage)
         if copy_media:
-            copy_album_cover(source_root, group, album_dir, artifact_dir)
+            artwork = copy_album_cover(source_root, group, album_dir, artifact_dir, artwork)
         albums.append(
             {
                 "album_artist": group.album_artist,
@@ -768,6 +773,7 @@ def stage_import(
                 "match_status": group.match_status,
                 "match_confidence": group.match_confidence,
                 "edition_clues": group.edition_clues,
+                "artwork": artwork,
                 "tracks": album_tracks,
             }
         )
@@ -791,7 +797,21 @@ def stage_import(
     return manifest
 
 
-def copy_album_cover(source_root: Path, group: AlbumGroup, album_dir: Path, artifact_dir: Path) -> None:
+def describe_artwork(group: AlbumGroup, library_root: Path) -> dict[str, str]:
+    destination = str(library_root / proposed_album_dir(group) / "cover.jpg")
+    parents = [track.source.parent for track in group.tracks]
+    for parent in parents:
+        for candidate in parent.iterdir() if parent.exists() else []:
+            if candidate.is_file() and candidate.name.lower() in COVER_NAMES:
+                return {"status": "planned", "mechanism": "local sidecar", "source": str(candidate), "destination": destination, "label": f"local {candidate.name}"}
+    if any(track.has_embedded_art for track in group.tracks):
+        return {"status": "planned", "mechanism": "embedded", "source": "embedded front cover", "destination": destination, "label": "embedded front cover"}
+    if group.musicbrainz_releaseid or group.musicbrainz_releasegroupid:
+        return {"status": "planned", "mechanism": "cover-art-archive", "source": "Cover Art Archive candidate", "destination": destination, "label": "Cover Art Archive candidate"}
+    return {"status": "missing", "mechanism": "none", "source": "", "destination": destination, "label": "none"}
+
+
+def copy_album_cover(source_root: Path, group: AlbumGroup, album_dir: Path, artifact_dir: Path, artwork: dict[str, str]) -> dict[str, str]:
     parents = [track.source.parent for track in group.tracks]
     for parent in parents + [source_root]:
         for candidate in parent.iterdir() if parent.exists() else []:
@@ -802,7 +822,24 @@ def copy_album_cover(source_root: Path, group: AlbumGroup, album_dir: Path, arti
                     shutil.copy2(candidate, target)
                 if not artifact_target.exists():
                     shutil.copy2(candidate, artifact_target)
-                return
+                artwork.update({"status": "published", "mechanism": "local sidecar", "source": str(candidate), "destination": str(target), "label": f"local {candidate.name}"})
+                return artwork
+    # Remote lookup is best-effort and intentionally cannot fail an audio import.
+    target = album_dir / "cover.jpg"
+    if artwork["mechanism"] == "cover-art-archive":
+        try:
+            result, _ = download_cover_jpg(group.musicbrainz_releaseid, group.musicbrainz_releasegroupid, target, 0.0)
+            if result.startswith("downloaded"):
+                artwork.update({"status": "published", "source": result, "destination": str(target), "label": "Cover Art Archive"})
+                return artwork
+            fallback = download_deezer_cover(group.album_artist, group.album, target)
+            if fallback.startswith("downloaded"):
+                artwork.update({"status": "published", "mechanism": "deezer", "source": fallback, "destination": str(target), "label": "Deezer cover"})
+                return artwork
+            artwork.update({"status": "missing", "source": f"{result}; {fallback}", "label": "none"})
+        except Exception as exc:
+            artwork.update({"status": "missing", "source": str(exc), "label": "none"})
+    return artwork
 
 
 def has_audio_files(path: Path) -> bool:

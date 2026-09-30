@@ -180,6 +180,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_path_overrides(parser)
     parser.add_argument("--mode", choices=("dry-run", "apply"), help="digital import mode")
     sub = parser.add_subparsers(dest="command")
+    sub.add_parser("help", help="show this help")
     config = sub.add_parser("config", help="show effective configuration")
     add_path_overrides(config)
     digital = sub.add_parser("digital", help="review digital music for import")
@@ -202,6 +203,8 @@ def main(argv: list[str] | None = None) -> int:
             override = getattr(args, key, None)
             if override is not None:
                 config[key] = str(override.expanduser())
+        if args.command == "help":
+            parser.print_help(); return 0
         if args.command == "config":
             show_config(config, args.config_file)
             return 0

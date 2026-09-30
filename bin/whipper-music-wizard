@@ -1812,6 +1812,19 @@ data["publication_completed"] = published
 data["expected_track_count"] = int(data.get("planned_tracks", 0))
 data["published_track_count"] = int(data.get("planned_tracks", 0)) if published else 0
 data["all_expected_tracks_published"] = published and data["published_track_count"] == data["expected_track_count"]
+data["audio"] = {
+    "expected_tracks": data["expected_track_count"], "staged_tracks": int(data.get("copied_tracks", 0)),
+    "published_tracks": data["published_track_count"], "skipped_or_conflicted_tracks": int(data.get("skipped_tracks", 0)),
+}
+auxiliary = []
+for album in data.get("albums", []):
+    artwork = album.get("artwork") or {}
+    if artwork:
+        auxiliary.append({"kind": "artwork", "status": artwork.get("status"), "mechanism": artwork.get("mechanism"), "source": artwork.get("source"), "destination": artwork.get("destination")})
+    album_dir = str(Path(album.get("tracks", [{}])[0].get("final_destination") or album.get("tracks", [{}])[0].get("destination_path") or "").parent)
+    if album_dir:
+        auxiliary.append({"kind": "import-manifest", "status": "published" if published else "not_published", "mechanism": "generated", "source": "", "destination": str(Path(album_dir) / ".library-import" / "IMPORT_MANIFEST.json")})
+data["auxiliary_files"] = auxiliary
 data["cleanup_eligible"] = bool(
     published and data.get("mode") == "apply" and data.get("approved_to_publish")
     and data.get("publication") == "copy" and data.get("source_lifecycle") == "preserved"
@@ -1955,6 +1968,18 @@ PYAPPROVAL
   fi
 
   write_digital_report "$result" "$status" "$stage"
+  if [[ "$status" == "digital import published" ]]; then
+    python3 - "$result" <<'PYART'
+import json, sys
+data = json.loads(open(sys.argv[1], encoding="utf-8").read())
+art = [a.get("artwork") or {} for a in data.get("albums", [])]
+published = sum(a.get("status") == "published" for a in art)
+missing = sum(a.get("status") == "missing" for a in art)
+print("Artwork")
+print(f"  {published} album covers published")
+print(f"  {missing} missing")
+PYART
+  fi
   print_digital_import_summary "$start_time" "$status" "$stage" "$result" "$kept_paths"
   [[ "$status" == "digital import published" ]] || return 1
   return 0
