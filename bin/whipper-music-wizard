@@ -1537,7 +1537,7 @@ rip_cd() {
   TT="$(track_template)"
   DT="$(disc_template)"
 
-  local start_time release_modes retry_outcome kept_paths final_status log yn
+  local start_time release_modes retry_outcome kept_paths final_status log yn rip_profile
   local RELEASE_ID="" final_stage="" final_log="" merged_stage="" merged_log="" rc=0
   local attempt_entries=()
   local attempt_stages=()
@@ -1550,6 +1550,8 @@ rip_cd() {
   release_modes=""
   retry_outcome="none"
   kept_paths=""
+  rip_profile="${MUSIC_INGEST_RIP_PROFILE:-secure}"
+  [[ "$rip_profile" == secure || "$rip_profile" == bounded ]] || { echo "Invalid rip profile: $rip_profile"; return 2; }
 
   cleanup_rip_tmp() {
     local path keep
@@ -1579,6 +1581,7 @@ rip_cd() {
   echo "  Track tpl:   $TT"
   echo "  Disc tpl:    $DT"
   echo "  Cover art:   $COVER_MODE"
+  echo "  Profile:     $rip_profile (verification retained)"
   if [[ "$damaged_mode" == "yes" ]]; then
     echo "  Retries:     $DAMAGED_MAX_RETRIES"
     echo "  Mode:        damaged disc"
@@ -1595,7 +1598,7 @@ rip_cd() {
     local log_file="$1"
     local allow_prompt="$2"
     shift 2
-    local line status pid yn pipe read_fd
+    local line status pid yn pipe read_fd last_activity track_no='' track_name='' verified=0 watchdog_prompted="no"
     local q_errors q_track q_total=0 q_prompted="no"
     BAD_DISC_ABORTED="no"
     : > "$log_file"
@@ -1608,11 +1611,23 @@ rip_cd() {
     set +e
     "$@" >"$pipe" 2>&1 &
     pid=$!
+    last_activity=$SECONDS
     # Open the FIFO once.  Reopening it for each `read` blocks forever after
     # the writer has emitted its final line and exited (the observed CD-R hang).
     exec {read_fd}<"$pipe"
-    while IFS= read -r -u "$read_fd" line; do
-      printf '%s\n' "$line" | tee -a "$log_file"
+    while :; do
+      if IFS= read -r -t 1 -u "$read_fd" line; then
+        printf '%s\n' "$line" >> "$log_file"
+        last_activity=$SECONDS
+        [[ "${MUSIC_INGEST_DEBUG:-0}" == 1 ]] && printf '%s\n' "$line"
+        if [[ $line =~ ripping[[:space:]]track[[:space:]]+([0-9]+)[[:space:]]+of[[:space:]]+([0-9]+):[[:space:]]+(.*)$ ]]; then
+          track_no="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"; track_name="${BASH_REMATCH[3]}"
+          printf 'Ripping track %s: %s\n' "$track_no" "$track_name"
+        elif [[ $line =~ checksums[[:space:]]match ]]; then
+          verified=$((verified + 1)); printf '  Verified track %s (%d completed)\n' "${track_no:-?}" "$verified"
+        elif [[ $line =~ ^(CRITICAL|ERROR|WARNING): ]]; then
+          printf '%s\n' "$line" >&2
+        fi
       if [[ "$allow_prompt" == "yes" && "$q_prompted" == "no" && "$line" =~ Track[[:space:]]+([0-9]+)[[:space:]]+finished,[[:space:]]+found[[:space:]]+([0-9]+)[[:space:]]+Q[[:space:]]sub-channels[[:space:]]with[[:space:]]CRC[[:space:]]errors ]]; then
         q_track="${BASH_REMATCH[1]}"
         q_errors="${BASH_REMATCH[2]}"
@@ -1630,6 +1645,22 @@ rip_cd() {
             fi
           else
             echo "   No interactive terminal is available; continuing the current attempt."
+          fi
+        fi
+      fi
+      else
+        if ! kill -0 "$pid" 2>/dev/null; then break; fi
+        if ((SECONDS - last_activity >= ${MUSIC_INGEST_STALL_SECONDS:-600})) && [[ "$watchdog_prompted" == no ]]; then
+          watchdog_prompted=yes
+          echo
+          echo "No Whipper progress for $((SECONDS - last_activity))s while processing track ${track_no:-unknown}."
+          echo "The secure read may be retrying a difficult sector."
+          if [[ -r /dev/tty ]] && read -rp '[C]ontinue waiting or [S]top safely and retain partial Incoming output? [C/s] ' yn </dev/tty && [[ "${yn,,}" == s || "${yn,,}" == stop ]]; then
+            RIP_WATCHDOG_STOPPED=yes
+            echo 'Stopping this attempt; verified completed tracks and diagnostics will be retained.'
+            kill -INT "$pid" >/dev/null 2>&1 || true
+          else
+            last_activity=$SECONDS; watchdog_prompted=no
           fi
         fi
       fi
@@ -1660,6 +1691,7 @@ rip_cd() {
     work_dirs+=("$work")
 
     retry_limit="$MAX_RETRIES"
+    [[ "$rip_profile" == bounded ]] && retry_limit=1
     allow_bad_disc_prompt="no"
     if [[ "$mode" == "damaged" ]]; then
       retry_limit="$DAMAGED_MAX_RETRIES"
@@ -1798,6 +1830,13 @@ rip_cd() {
       echo "✘ Fail: Rip failed."
     fi
     diagnose_rip_failure "$final_log"
+  fi
+
+  if [[ "${RIP_WATCHDOG_STOPPED:-no}" == yes ]]; then
+    kept_paths="$final_stage"
+    final_status="stopped after no-progress watchdog; partial Incoming output retained"
+    print_session_summary "$start_time" "$final_status" "$RELEASE_ID" "$release_modes" "$final_stage" "$final_log" "$retry_outcome" "$kept_paths"
+    return 1
   fi
 
   if ! stage_has_flacs "$final_stage"; then

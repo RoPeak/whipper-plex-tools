@@ -103,7 +103,7 @@ def staging_command(config: dict[str, object], action: str) -> int:
 
 def run_action(
     action: str, config: dict[str, object], mode: str | None = None, device: Path | None = None,
-    allow_cdr: bool = False,
+    allow_cdr: bool = False, rip_profile: str = "secure",
 ) -> int:
     if action == "cd":
         if not shutil.which("whipper"):
@@ -149,6 +149,8 @@ def run_action(
     # Explicit one-session intent only.  Never persist permission for future discs.
     if allow_cdr:
         env["MUSIC_INGEST_ALLOW_CDR"] = "yes"
+    if rip_profile != "secure":
+        env["MUSIC_INGEST_RIP_PROFILE"] = rip_profile
     return subprocess.run([str(WIZARD)], env=env, check=False).returncode
 
 
@@ -200,6 +202,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_path_overrides(cd)
     cd.add_argument("--device", type=Path, help="use this optical device for this CD session only")
     cd.add_argument("--allow-cdr", action="store_true", help="explicitly permit Whipper's CD-R mode for this session")
+    cd.add_argument("--rip-profile", choices=("secure", "bounded"), default="secure", help="secure uses five retries; bounded uses one while retaining verification")
     staging = sub.add_parser("staging", help="inspect or safely clean tool-owned staging")
     staging.add_argument("action", choices=("status", "cleanup"), nargs="?", default="status")
     add_path_overrides(staging)
@@ -223,7 +226,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "digital":
             return run_action("digital", config, args.mode)
         if args.command == "cd":
-            return run_action("cd", config, "apply", args.device, args.allow_cdr)
+            return run_action("cd", config, "apply", args.device, args.allow_cdr, args.rip_profile)
         if args.command == "staging":
             return staging_command(config, args.action)
         return wizard(config)

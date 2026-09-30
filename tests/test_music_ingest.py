@@ -13,6 +13,10 @@ class MusicIngestConfigTests(unittest.TestCase):
         args = music_ingest.build_parser().parse_args(["cd", "--allow-cdr"])
         self.assertTrue(args.allow_cdr)
 
+    def test_cd_defaults_to_secure_profile_and_accepts_bounded(self):
+        self.assertEqual(music_ingest.build_parser().parse_args(["cd"]).rip_profile, "secure")
+        self.assertEqual(music_ingest.build_parser().parse_args(["cd", "--rip-profile", "bounded"]).rip_profile, "bounded")
+
     def test_path_overrides_work_before_or_after_subcommand(self):
         parser = music_ingest.build_parser()
         before = parser.parse_args(["--library", "/tmp/before", "digital"])
