@@ -23,20 +23,29 @@ class PublicationApprovalTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             stage, library = root / "stage", root / "library"
-            result = self.approve(stage, library, "APPLY\n")
+            result = self.approve(stage, library, "a\nAPPLY\n")
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("CD rip publication plan", result.stdout)
-            self.assertIn("01 - Track.flac", result.stdout)
-            self.assertIn(str(library / "Artist/Album/01 - Track.flac"), result.stdout)
+            self.assertNotIn("01 - Track.flac", result.stdout)
+            self.assertIn("[V] View all file mappings", result.stdout)
 
     def test_cd_decline_is_clean_and_does_not_publish(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             stage, library = root / "stage", root / "library"
-            result = self.approve(stage, library, "no\n")
+            result = self.approve(stage, library, "c\n")
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("Publication cancelled", result.stdout)
             self.assertFalse(library.exists())
+
+    def test_full_mapping_is_available_on_demand(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stage, library = root / "stage", root / "library"
+            result = self.approve(stage, library, "v\na\nAPPLY\n")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("01 - Track.flac", result.stdout)
+            self.assertIn(str(library / "Artist/Album/01 - Track.flac"), result.stdout)
 
 
 class AtomicPublicationTests(unittest.TestCase):

@@ -1208,12 +1208,17 @@ print_session_summary() {
   echo "Session summary:"
   echo "  Status:              $status_label"
   echo "  Elapsed:             $elapsed"
-  echo "  Mode(s):             ${modes:-unknown}"
+  echo "  Rip mode(s):         ${modes:-unknown}"
+  echo "  Medium classification: $([[ ${MUSIC_INGEST_ALLOW_CDR:-no} == yes ]] && printf 'CD-R' || printf 'pressed/unknown')"
+  echo "  CD-R permission:     $([[ ${MUSIC_INGEST_ALLOW_CDR:-no} == yes ]] && printf 'explicitly approved' || printf 'not required/unknown')"
   echo "  Release ID:          ${release_id:-<not selected>}"
   echo "  Completed FLACs:     $completed"
   echo "  Published files:     $published"
   echo "  Conflicts/skipped:   $conflicts"
-  echo "  AccurateRip:         accurate $accurate, not accurate $not_accurate, unknown/error $unknown_error"
+  echo "  AccurateRip:"
+  echo "    Verified:           $accurate"
+  echo "    Not matched:        $not_accurate"
+  echo "    Unknown/error:      $unknown_error"
   echo "  Retry outcome:       ${retry_outcome:-none}"
   if ((${#failed[@]} > 0)); then
     echo "  Failed/suspect:"
@@ -1577,7 +1582,9 @@ rip_cd() {
   echo
   echo "Ripping with:"
   echo "  Device:      $DEVICE"
-  echo "  Output root: $OUT_ROOT"
+  echo "  Rip staging: ${MUSIC_INGEST_INCOMING:-<configured Incoming>}/whipper-out-*"
+  echo "  Library:     $OUT_ROOT"
+  echo "  Source lifecycle: preserved until cleanup"
   echo "  Track tpl:   $TT"
   echo "  Disc tpl:    $DT"
   echo "  Cover art:   $COVER_MODE"
@@ -1587,7 +1594,7 @@ rip_cd() {
     echo "  Mode:        damaged disc"
     echo "Damaged disc mode: using $DAMAGED_MAX_RETRIES max retry/retries per track to avoid long stalls."
   else
-    echo "  Retries:     $MAX_RETRIES"
+    echo "  Retries:     $([[ $rip_profile == bounded ]] && printf '1' || printf '%s' "$MAX_RETRIES")"
     if [[ "$MAX_RETRIES" =~ ^[0-9]+$ && "$MAX_RETRIES" -ge 5 ]]; then
       echo "  Note:        badly damaged tracks can take a long time with $MAX_RETRIES retries."
     fi
@@ -1609,7 +1616,9 @@ rip_cd() {
     pipe="$(mktemp -u "${TMPDIR:-/tmp}/whipper-output-XXXXXX")"
     mkfifo -- "$pipe"
     set +e
-    "$@" >"$pipe" 2>&1 &
+    # Give Whipper and helpers their own process group.  This makes a normal
+    # cancellation release the optical device without reaching for fuser -k.
+    setsid "$@" >"$pipe" 2>&1 &
     pid=$!
     last_activity=$SECONDS
     # Open the FIFO once.  Reopening it for each `read` blocks forever after
@@ -1624,7 +1633,7 @@ rip_cd() {
           track_no="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"; track_name="${BASH_REMATCH[3]}"
           printf 'Ripping track %s: %s\n' "$track_no" "$track_name"
         elif [[ $line =~ checksums[[:space:]]match ]]; then
-          verified=$((verified + 1)); printf '  Verified track %s (%d completed)\n' "${track_no:-?}" "$verified"
+          verified=$((verified + 1)); printf '  Secure extraction complete: track %s (%d completed)\n' "${track_no:-?}" "$verified"
         elif [[ $line =~ ^(CRITICAL|ERROR|WARNING): ]]; then
           printf '%s\n' "$line" >&2
         fi
@@ -1640,7 +1649,7 @@ rip_cd() {
           if [[ -r /dev/tty ]] && read -rp "Stop this normal attempt and restart in damaged disc mode? [Y/n] " yn </dev/tty; then
             if ! is_no "${yn:-}"; then
               BAD_DISC_ABORTED="yes"
-              kill "$pid" >/dev/null 2>&1
+              kill -TERM -- "-$pid" >/dev/null 2>&1 || true
               break
             fi
           else
@@ -1658,7 +1667,7 @@ rip_cd() {
           if [[ -r /dev/tty ]] && read -rp '[C]ontinue waiting or [S]top safely and retain partial Incoming output? [C/s] ' yn </dev/tty && [[ "${yn,,}" == s || "${yn,,}" == stop ]]; then
             RIP_WATCHDOG_STOPPED=yes
             echo 'Stopping this attempt; verified completed tracks and diagnostics will be retained.'
-            kill -INT "$pid" >/dev/null 2>&1 || true
+            kill -INT -- "-$pid" >/dev/null 2>&1 || true
           else
             last_activity=$SECONDS; watchdog_prompted=no
           fi
@@ -1861,6 +1870,23 @@ rip_cd() {
   fi
   if [[ "$COVER_MODE" == "embed" || "$COVER_MODE" == "complete" ]]; then
     postprocess_cover_art "${dirs[@]}"
+  fi
+
+  local ar_accurate ar_not_matched ar_unknown
+  ar_accurate="$(accurip_count "$final_log" 'track[[:space:]]+[0-9]+:[[:space:]]+rip accurate')"
+  ar_not_matched="$(accurip_count "$final_log" 'track[[:space:]]+[0-9]+:[[:space:]]+rip NOT accurate')"
+  ar_unknown="$(accurip_count "$final_log" 'track[[:space:]]+[0-9]+:[[:space:]]+unknown[[:space:]]+\\(error\\)')"
+  if ((ar_accurate == 0 && ar_not_matched > 0)); then
+    echo
+    echo "WARNING: This rip completed but was not independently verified by AccurateRip."
+    echo "AccurateRip — Verified: $ar_accurate | Not matched: $ar_not_matched | Unknown: $ar_unknown"
+    echo 'Possible explanations include CD-R media, a different pressing, or a checksum/offset discrepancy.'
+    read -rp 'Publish this unverified rip anyway? [y/N] ' yn || yn=n
+    if ! is_yes "${yn:-}"; then
+      final_status='kept staged - unverified publication declined'; kept_paths="$final_stage"
+      print_session_summary "$start_time" "$final_status" "$RELEASE_ID" "$release_modes" "$final_stage" "$final_log" "$retry_outcome" "$kept_paths"
+      return 1
+    fi
   fi
 
   echo "Publishing staged rip into library..."

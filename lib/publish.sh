@@ -1,14 +1,21 @@
 #!/usr/bin/env bash
 # Atomic no-clobber file publication for same-filesystem music stages.
 confirm_publish_plan() {
-  local stage="$1" dest="$2" label="$3" source rel approval
+  local stage="$1" dest="$2" label="$3" source rel approval choice
   shift 3
   local files=("$@")
   echo
-  echo "$label publication plan (${#files[@]} file(s); source/staging preserved):"
-  for source in "${files[@]}"; do
-    rel="${source#"$stage"/}"
-    printf '  %s -> %s/%s\n' "$source" "$dest" "$rel"
+  echo "$label publication plan (${#files[@]} file(s); source/staging preserved)."
+  echo "Destination: $dest"
+  echo "[V] View all file mappings  [A] Apply  [C] Cancel"
+  while :; do
+    read -rp 'Choose [a]: ' choice || choice=c
+    case "${choice,,}" in
+      ''|a) break ;;
+      v) for source in "${files[@]}"; do rel="${source#"$stage"/}"; printf '  %s -> %s/%s\n' "$source" "$dest" "$rel"; done ;;
+      c) echo "Publication cancelled; staged output is retained at: $stage"; return 1 ;;
+      *) echo 'Choose V, A, or C.' ;;
+    esac
   done
   read -rp "Type APPLY to publish this staged output (anything else cancels): " approval || approval=""
   if [[ "$approval" != "APPLY" ]]; then
