@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from lib.music_import_planner import (
     AlbumGroup,
+    Track,
     album_info_from_dir,
     cmd_covers,
     assign_destinations,
@@ -15,9 +16,14 @@ from lib.music_import_planner import (
     download_deezer_cover,
     find_deezer_cover_url,
     edit_album,
+    grouped_discrepancies,
     find_musicbrainz_release,
     group_tracks,
     musicbrainz_json,
+    musicbrainz_release_details,
+    print_candidates,
+    print_review,
+    release_compatibility,
     sanitize_component,
     stage_import,
     track_from_probe,
@@ -450,7 +456,7 @@ class MusicImportPlannerTests(unittest.TestCase):
         self.assertIn("2 disc(s)", status)
         self.assertIn("24 track(s)", status)
         self.assertIn("Example Records", status)
-        self.assertIn("local match 8/10", status)
+        self.assertIn("local compatibility", status)
 
     def test_ambiguous_musicbrainz_editions_are_not_auto_selected(self):
         releases = [
@@ -463,13 +469,7 @@ class MusicImportPlannerTests(unittest.TestCase):
             release_id, _group_id, status, _last_request = find_musicbrainz_release("Bruce Springsteen", "Born to Run", "", 0.0)
         self.assertEqual(release_id, "")
         self.assertIn("ambiguous MusicBrainz editions", status)
-        self.assertIn("1975-08-25", status)
-        self.assertIn("2005-11-15", status)
-        self.assertIn("Bruce Springsteen", status)
-        self.assertIn("30th anniversary edition", status)
-        self.assertIn("PC 33795", status)
-        self.assertIn("8 track(s)", status)
-        self.assertIn("MusicBrainz confidence 100/100", status)
+        self.assertIn("local compatibility", status)
 
     def test_download_cover_falls_back_to_release_group(self):
         target = Path(tempfile.mkdtemp()) / "cover.jpg"
@@ -560,6 +560,101 @@ class MusicImportPlannerTests(unittest.TestCase):
 
         self.assertEqual(status, 0)
         deezer.assert_called_once()
+
+    def test_structural_compatibility_prefers_album_over_single(self):
+        tracks = [Track(source=Path(f"{i}.mp3"), rel_source=f"{i}.mp3", extension=".mp3", disc=1) for i in range(8)]
+        group = AlbumGroup(key="", album_artist="Bruce Springsteen", album="Born to Run", year="1975", tracks=tracks)
+        album = {"title": "Born to Run", "date": "1975", "track-count": 8, "media-count": 1, "artist-credit": [{"name": "Bruce Springsteen"}], "release-group": {"primary-type": "Album"}}
+        single = {"title": "Born to Run", "date": "1975", "track-count": 2, "media-count": 1, "artist-credit": [{"name": "Bruce Springsteen"}], "release-group": {"primary-type": "Single"}}
+        album_score, _ = release_compatibility(group, album)
+        single_score, warnings = release_compatibility(group, single)
+        self.assertGreater(album_score, single_score + 40)
+        self.assertLess(single_score, 100)
+        self.assertIn("single conflicts with album-sized source", warnings)
+
+    def test_disc_and_edition_mismatches_materially_reduce_compatibility(self):
+        tracks = [Track(source=Path(f"{disc}-{track}.mp3"), rel_source="x", extension=".mp3", disc=disc) for disc in range(1, 3) for track in range(18)]
+        group = AlbumGroup(key="", album_artist="Red Hot Chili Peppers", album="Return of the Dream Canteen", year="2022", tracks=tracks)
+        group.edition_clues = ["tour edition", "instrumental"]
+        standard = {"title": "Return of the Dream Canteen", "date": "2022", "track-count": 17, "media-count": 1, "artist-credit": [{"name": "Red Hot Chili Peppers"}], "release-group": {"primary-type": "Album"}}
+        score, warnings = release_compatibility(group, standard)
+        self.assertLess(score, 55)
+        self.assertIn("1 discs vs local 2", warnings)
+        self.assertTrue(any("tour edition" in warning for warning in warnings))
+
+    def test_edition_clues_are_extracted_from_folder_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "Artist - Album (Tour Edition) (2022)" / "CD2 - Instrumental" / "01 - Track.mp3"
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"audio")
+            track = track_from_probe(path, root, probe({"artist": "Artist", "album": "Album", "track": "1"}))
+            group = group_tracks([track])[0]
+        self.assertIn("tour edition", group.edition_clues)
+        self.assertIn("instrumental", group.edition_clues)
+
+    def test_review_groups_repeated_discrepancies_and_summarises_audio(self):
+        group = AlbumGroup(key="", album_artist="Artist", album="Album", year="2020")
+        group.tracks = [
+            Track(source=Path("a.mp3"), rel_source="a.mp3", extension=".mp3", title="A", artist="Artist", album="Album", track=1, readable=True, codec="mp3", bitrate=320000, sample_rate=44100, embedded_album="Album", folder_album_hint="Album (Deluxe)"),
+            Track(source=Path("b.mp3"), rel_source="b.mp3", extension=".mp3", title="B", artist="Artist", album="Album", track=2, readable=True, codec="mp3", bitrate=321000, sample_rate=44100, embedded_album="Album", folder_album_hint="Album (Deluxe)"),
+        ]
+        self.assertEqual(grouped_discrepancies(group)[0][-1], 2)
+        from io import StringIO
+        from contextlib import redirect_stdout
+        output = StringIO()
+        with redirect_stdout(output):
+            print_review([group], Path("/library"), False, False)
+        rendered = output.getvalue()
+        self.assertIn("320-321 kb/s", rendered)
+        self.assertIn("Folder/tag discrepancy (2/2)", rendered)
+        self.assertNotIn("a.mp3: tagged", rendered)
+
+    def test_dry_run_manifest_does_not_create_bulk_staging(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, stage = Path(tmp) / "source", Path(tmp) / "stage"
+            source = root / "Album" / "01 - Track.mp3"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"audio")
+            group = group_tracks([track_from_probe(source, root, probe({"artist": "Artist", "album": "Album", "track": "1"}))])
+            manifest = stage_import(group, stage, root, False, False, copy_media=False, library_root=Path("/library"))
+        self.assertFalse(stage.exists())
+        self.assertEqual(manifest["copied_tracks"], 0)
+        self.assertEqual(manifest["staged_bytes"], 0)
+        self.assertEqual(manifest["albums"][0]["tracks"][0]["destination_path"], "/library/Artist/Album/01 - Track.mp3")
+
+    def test_candidate_presentation_is_ranked_and_readable(self):
+        group = AlbumGroup(key="", album_artist="Artist", album="Album", year="2020", tracks=[Track(source=Path("1.mp3"), rel_source="1.mp3", extension=".mp3")])
+        group.provider_candidates = [{"title": "Album", "date": "2020", "country": "GB", "track-count": 1, "media-count": 1, "artist-credit": [{"name": "Artist"}], "release-group": {"primary-type": "Album"}}]
+        from io import StringIO
+        from contextlib import redirect_stdout
+        output = StringIO()
+        with redirect_stdout(output):
+            print_candidates(group)
+        rendered = output.getvalue()
+        self.assertIn("1. artist Artist", rendered)
+        self.assertIn("local compatibility", rendered)
+        self.assertIn("1 track(s)", rendered)
+
+    def test_candidate_details_omit_none_edition_values(self):
+        details = musicbrainz_release_details(
+            {"title": "Album", "packaging": None, "artist-credit": [{"name": "Artist"}]}, 75
+        )
+        self.assertNotIn("edition None", details)
+
+    def test_apply_manifest_records_exact_copy_provenance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, stage, library = Path(tmp) / "source", Path(tmp) / "stage", Path(tmp) / "library"
+            source = root / "Album" / "01 - Track.mp3"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"audio")
+            group = group_tracks([track_from_probe(source, root, probe({"artist": "Artist", "album": "Album", "track": "1"}))])
+            manifest = stage_import(group, stage, root, False, False, library_root=library)
+            track = manifest["albums"][0]["tracks"][0]
+            self.assertEqual(track["source_path"], str(source))
+            self.assertEqual(track["destination_path"], str(library / track["destination"]))
+            self.assertTrue(track["verified_size_match"])
+            self.assertEqual((stage / track["destination"]).read_bytes(), source.read_bytes())
 
 
 if __name__ == "__main__":

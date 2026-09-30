@@ -26,6 +26,8 @@ DEFAULTS = {
     "cover_mode": "file",
 }
 
+STAGING_PREFIXES = ("music-import-out-", "whipper-out-")
+
 
 def load_config(path: Path = CONFIG_PATH) -> dict[str, object]:
     config = DEFAULTS.copy()
@@ -49,6 +51,54 @@ def show_config(config: dict[str, object], path: Path = CONFIG_PATH) -> None:
     print(f"Config: {path}")
     for key, value in config.items():
         print(f"{key} = {value}")
+
+
+def owned_staging_dirs(staging: Path) -> list[Path]:
+    """Only immediate directories with an application-created prefix are manageable."""
+    if not staging.is_dir():
+        return []
+    return sorted(
+        path for path in staging.iterdir()
+        if path.is_dir() and path.name.startswith(STAGING_PREFIXES) and path.parent == staging
+    )
+
+
+def staging_size(path: Path) -> int:
+    return sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
+
+
+def staging_command(config: dict[str, object], action: str) -> int:
+    staging = Path(str(config["staging"])).resolve()
+    entries = owned_staging_dirs(staging)
+    if action == "status":
+        print(f"Staging: {staging}")
+        if not entries:
+            print("No tool-owned staged operations found.")
+            return 0
+        for entry in entries:
+            print(f"{entry.name}: {staging_size(entry)} bytes")
+        return 0
+    if action == "cleanup":
+        if not entries:
+            print("No tool-owned staged operations found.")
+            return 0
+        print("The following tool-owned staging directories will be removed:")
+        for entry in entries:
+            print(f"  {entry} ({staging_size(entry)} bytes)")
+        try:
+            approved = input("Type CLEANUP to remove only these staged directories: ").strip() == "CLEANUP"
+        except (EOFError, KeyboardInterrupt):
+            approved = False
+        if not approved:
+            print("Staging cleanup cancelled.")
+            return 0
+        for entry in entries:
+            # Re-check parent/name immediately before removal; never traverse arbitrary paths.
+            if entry.parent == staging and entry.name.startswith(STAGING_PREFIXES):
+                shutil.rmtree(entry)
+        print("Tool-owned staging cleanup complete.")
+        return 0
+    raise ValueError(f"unknown staging action: {action}")
 
 
 def run_action(action: str, config: dict[str, object], mode: str | None = None) -> int:
@@ -75,6 +125,9 @@ def run_action(action: str, config: dict[str, object], mode: str | None = None) 
         print("Incoming and library paths must not overlap.", file=sys.stderr)
         return 2
     staging.mkdir(parents=True, exist_ok=True)
+    if staging.stat().st_dev != library.stat().st_dev:
+        print("Staging and production library must be on the same filesystem.", file=sys.stderr)
+        return 2
     env = os.environ.copy()
     env.update({
         "MUSIC_INGEST_LIBRARY": str(library),
@@ -134,6 +187,9 @@ def build_parser() -> argparse.ArgumentParser:
     add_path_overrides(digital)
     cd = sub.add_parser("cd", help="start the Whipper CD workflow")
     add_path_overrides(cd)
+    staging = sub.add_parser("staging", help="inspect or safely clean tool-owned staging")
+    staging.add_argument("action", choices=("status", "cleanup"), nargs="?", default="status")
+    add_path_overrides(staging)
     return parser
 
 
@@ -153,6 +209,8 @@ def main(argv: list[str] | None = None) -> int:
             return run_action("digital", config, args.mode)
         if args.command == "cd":
             return run_action("cd", config, "apply")
+        if args.command == "staging":
+            return staging_command(config, args.action)
         return wizard(config)
     except (EOFError, KeyboardInterrupt):
         print("music-ingest: cancelled; nothing was published.")

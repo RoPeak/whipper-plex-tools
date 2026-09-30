@@ -1,7 +1,9 @@
 import tempfile
 import unittest
+from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
+from contextlib import redirect_stdout
 
 from lib import music_ingest
 
@@ -80,6 +82,35 @@ class MusicIngestConfigTests(unittest.TestCase):
     def test_bare_wizard_cancellation_is_clean(self):
         with patch("builtins.input", side_effect=EOFError):
             self.assertEqual(music_ingest.wizard(dict(music_ingest.DEFAULTS)), 0)
+
+    def test_staging_status_only_lists_owned_immediate_directories(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            owned = root / "music-import-out-test"
+            foreign = root / "someone-elses-data"
+            owned.mkdir()
+            foreign.mkdir()
+            (owned / "track.mp3").write_bytes(b"audio")
+            output = StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(music_ingest.staging_command({**music_ingest.DEFAULTS, "staging": str(root)}, "status"), 0)
+        self.assertIn("music-import-out-test", output.getvalue())
+        self.assertNotIn("someone-elses-data", output.getvalue())
+
+    def test_staging_cleanup_requires_confirmation_and_never_removes_foreign_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            owned = root / "music-import-out-test"
+            foreign = root / "foreign"
+            owned.mkdir()
+            foreign.mkdir()
+            with patch("builtins.input", return_value="no"):
+                self.assertEqual(music_ingest.staging_command({**music_ingest.DEFAULTS, "staging": str(root)}, "cleanup"), 0)
+            self.assertTrue(owned.exists())
+            with patch("builtins.input", return_value="CLEANUP"):
+                self.assertEqual(music_ingest.staging_command({**music_ingest.DEFAULTS, "staging": str(root)}, "cleanup"), 0)
+            self.assertFalse(owned.exists())
+            self.assertTrue(foreign.exists())
 
 
 if __name__ == "__main__":

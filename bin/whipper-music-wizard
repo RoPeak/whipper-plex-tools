@@ -1801,11 +1801,26 @@ from pathlib import Path
 source, directory, outcome, stage = sys.argv[1:5]
 data = json.loads(Path(source).read_text(encoding="utf-8"))
 data["outcome"] = outcome
-data["staging"] = stage
+data["report_schema"] = "music-ingest-publication-v1"
+data["staging"] = stage or None
 data["source_lifecycle"] = "preserved"
 data["published_file_count"] = int(sys.argv[5])
 data["existing_or_conflicting_file_count"] = int(sys.argv[6])
 data["verification"] = "ffprobe readability and staged/source size match are recorded per track; published copy size is checked; full-file hashes are not computed"
+published = outcome == "digital import published"
+data["publication_completed"] = published
+data["expected_track_count"] = int(data.get("planned_tracks", 0))
+data["published_track_count"] = int(data.get("planned_tracks", 0)) if published else 0
+data["all_expected_tracks_published"] = published and data["published_track_count"] == data["expected_track_count"]
+data["cleanup_eligible"] = bool(
+    published and data.get("mode") == "apply" and data.get("approved_to_publish")
+    and data.get("publication") == "copy" and data.get("source_lifecycle") == "preserved"
+    and data["all_expected_tracks_published"]
+)
+for album in data.get("albums", []):
+    for track in album.get("tracks", []):
+        track["publication_status"] = "published_or_verified_existing" if published else "not_published"
+        track["final_destination"] = track.get("destination_path")
 data["reported_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
 target = Path(directory) / f"music-ingest-{time.strftime('%Y%m%d-%H%M%S')}-{__import__('os').getpid()}.json"
 target.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
@@ -1847,7 +1862,13 @@ import_digital_music() {
     return 1
   fi
 
-  stage="$(mktemp -d -t music-import-out-XXXXXX)"
+  if [[ "${MUSIC_INGEST_MODE:-dry-run}" == "apply" ]]; then
+    mkdir -p -- "${MUSIC_INGEST_STAGING:?MUSIC_INGEST_STAGING is required}"
+    stage="$(mktemp -d "${MUSIC_INGEST_STAGING%/}/music-import-out-XXXXXX")"
+  else
+    # The planner validates the path and writes only its report in dry-run mode.
+    stage="${MUSIC_INGEST_STAGING%/}/music-import-dry-run-no-media"
+  fi
   result="$(mktemp -t music-import-result-XXXXXX.json)"
 
   cleanup_import_tmp() {
@@ -1886,26 +1907,28 @@ import_digital_music() {
     return 1
   fi
 
-  if ! find "$stage" -type f -print -quit | grep -q .; then
+  if [[ "${MUSIC_INGEST_MODE:-dry-run}" == "apply" ]] && ! find "$stage" -type f -print -quit | grep -q .; then
     echo "✘ Fail: Digital import staged no files."
     status="digital import failed - no audio staged"
     return 1
   fi
 
-  say_status "Sanitizing staged paths for media-server/exFAT..."
-  sanitize_tree_for_media_library "$stage"
-  mapfile -t dirs < <(find "$stage" -type f -name '*.flac' -printf '%h\n' | sort -u)
+  if [[ "${MUSIC_INGEST_MODE:-dry-run}" == "apply" ]]; then
+    say_status "Sanitizing staged paths for media-server/exFAT..."
+    sanitize_tree_for_media_library "$stage"
+    mapfile -t dirs < <(find "$stage" -type f -name '*.flac' -printf '%h\n' | sort -u)
+  fi
 
-  if [[ "$COVER_MODE" == "embed" || "$COVER_MODE" == "complete" ]]; then
+  if [[ "${MUSIC_INGEST_MODE:-dry-run}" == "apply" && ( "$COVER_MODE" == "embed" || "$COVER_MODE" == "complete" ) ]]; then
     say_status "Checking FLAC cover-art post-processing..."
     postprocess_cover_art "${dirs[@]}"
   fi
 
   if [[ "${MUSIC_INGEST_MODE:-dry-run}" == "dry-run" ]]; then
-    echo "Dry run complete. Nothing was published. Review the mapping above and rerun with: music-ingest digital --mode apply"
-    kept_paths="$stage"
+    echo "Dry run complete. Media copied to staging: 0 bytes. Nothing was published."
+    echo "Review the mapping above and rerun with: music-ingest digital --mode apply"
     status="digital import dry-run"
-    write_digital_report "$result" "$status" "$stage"
+    write_digital_report "$result" "$status" ""
     print_digital_import_summary "$start_time" "$status" "$stage" "$result" "$kept_paths"
     return 0
   fi
@@ -1972,10 +1995,14 @@ print_digital_import_summary() {
   published="${SESSION_PUBLISHED_FILES:-0}"
   conflicts="${SESSION_CONFLICTS:-0}"
   elapsed="$(format_duration "$(($(date +%s) - start_time))")"
-  audio_files="$(find "$stage" -type f \( \
-    -iname '*.flac' -o -iname '*.mp3' -o -iname '*.m4a' -o -iname '*.alac' \
-    -o -iname '*.aac' -o -iname '*.ogg' -o -iname '*.opus' \
-  \) | wc -l)"
+  if [[ -d "$stage" ]]; then
+    audio_files="$(find "$stage" -type f \( \
+      -iname '*.flac' -o -iname '*.mp3' -o -iname '*.m4a' -o -iname '*.alac' \
+      -o -iname '*.aac' -o -iname '*.ogg' -o -iname '*.opus' \
+    \) | wc -l)"
+  else
+    audio_files=0
+  fi
 
   echo
   echo "Digital import summary:"

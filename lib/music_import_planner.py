@@ -82,6 +82,9 @@ class AlbumGroup:
     musicbrainz_releaseid: str = ""
     musicbrainz_releasegroupid: str = ""
     match_status: str = "not searched"
+    match_confidence: int = 0
+    edition_clues: list[str] = field(default_factory=list)
+    provider_candidates: list[dict[str, Any]] = field(default_factory=list)
     skip: bool = False
 
 
@@ -337,8 +340,23 @@ def group_tracks(tracks: list[Track]) -> list[AlbumGroup]:
         group.album = most_common([t.album for t in items]) or "Unknown Album"
         group.year = most_common([t.year for t in items])
         group.musicbrainz_releaseid = most_common([t.musicbrainz_releaseid for t in items])
+        group.edition_clues = edition_clues_for_group(group)
         groups.append(group)
     return sorted(groups, key=lambda g: (g.album_artist.casefold(), g.year, g.album.casefold()))
+
+
+EDITION_WORDS = ("tour edition", "expanded edition", "deluxe edition", "remaster", "anniversary", "live", "instrumental", "bonus", "demo")
+
+
+def edition_clues_for_group(group: AlbumGroup) -> list[str]:
+    """Return explicit local release clues without changing the embedded album title."""
+    haystack = " ".join(
+        [group.album]
+        + [track.folder_album_hint for track in group.tracks]
+        + [track.embedded_album for track in group.tracks]
+        + [str(track.source.parent) for track in group.tracks]
+    ).casefold()
+    return [word for word in EDITION_WORDS if word in haystack]
 
 
 def most_common(values: list[str]) -> str:
@@ -385,7 +403,9 @@ def enrich_with_musicbrainz(groups: list[AlbumGroup]) -> None:
             status(f"  MusicBrainz {index}/{len(groups)}: {group.album_artist} - {group.album}: {group.match_status}")
             continue
         status(f"  MusicBrainz {index}/{len(groups)}: {group.album_artist} - {group.album}")
-        release_id, release_group_id_value, match_status, last_request = find_musicbrainz_release(group.album_artist, group.album, group.year, last_request)
+        release_id, release_group_id_value, match_status, last_request = find_musicbrainz_release(
+            group.album_artist, group.album, group.year, last_request, group=group
+        )
         group.match_status = match_status
         if release_id:
             group.musicbrainz_releaseid = release_id
@@ -401,19 +421,91 @@ def release_group_id(release: dict[str, Any]) -> str:
     return ""
 
 
-def release_score(group: AlbumGroup, release: dict[str, Any]) -> int:
-    score = 0
-    title = str(release.get("title") or "")
-    artist_credit = " ".join(str(ac.get("name") or "") for ac in release.get("artist-credit", []) if isinstance(ac, dict))
-    if title.casefold() == group.album.casefold():
-        score += 5
-    elif group.album.casefold() in title.casefold() or title.casefold() in group.album.casefold():
-        score += 2
-    if group.album_artist != "Unknown Artist" and group.album_artist.casefold() in artist_credit.casefold():
-        score += 3
-    if group.year and str(release.get("date") or "").startswith(group.year):
-        score += 2
-    return score
+def release_counts(release: dict[str, Any]) -> tuple[int, int]:
+    media = release.get("media") or []
+    discs = int(release.get("media-count") or release.get("media_count") or len(media) or 0)
+    tracks = int(release.get("track-count") or release.get("track_count") or 0)
+    if not tracks:
+        tracks = sum(int(item.get("track-count") or item.get("track_count") or 0) for item in media if isinstance(item, dict))
+    return discs, tracks
+
+
+def release_type(release: dict[str, Any]) -> str:
+    release_group = release.get("release-group") or release.get("release_group") or {}
+    return str(release_group.get("primary-type") or release_group.get("primary_type") or "") if isinstance(release_group, dict) else ""
+
+
+def release_artist(release: dict[str, Any]) -> str:
+    credits = release.get("artist-credit") or release.get("artist_credit") or []
+    values = []
+    for item in credits:
+        if isinstance(item, dict):
+            artist = item.get("artist") or {}
+            values.append(str(item.get("name") or artist.get("name") or ""))
+    return " ".join(values)
+
+
+def release_compatibility(group: AlbumGroup, release: dict[str, Any]) -> tuple[int, list[str]]:
+    """Score local release evidence, deliberately penalising structural mismatches."""
+    score, notes = 0, []
+    title = normalize_text(str(release.get("title") or ""))
+    wanted_title = normalize_text(group.album)
+    artist = normalize_text(release_artist(release))
+    wanted_artist = normalize_text(group.album_artist)
+    if title == wanted_title:
+        score += 30
+    elif title and wanted_title and (title in wanted_title or wanted_title in title):
+        score += 16
+        notes.append("title differs")
+    else:
+        notes.append("title mismatch")
+    if artist == wanted_artist:
+        score += 20
+    elif artist and wanted_artist and (artist in wanted_artist or wanted_artist in artist):
+        score += 10
+        notes.append("artist differs")
+    else:
+        notes.append("artist mismatch")
+    if group.year:
+        if str(release.get("date") or "").startswith(group.year):
+            score += 10
+        elif release.get("date"):
+            score -= 6
+            notes.append(f"year {release.get('date')}")
+    local_discs = max((track.disc or 1) for track in group.tracks) if group.tracks else 0
+    candidate_discs, candidate_tracks = release_counts(release)
+    local_tracks = len(group.tracks)
+    if candidate_tracks and local_tracks:
+        if candidate_tracks == local_tracks:
+            score += 22
+        else:
+            difference = abs(candidate_tracks - local_tracks) / max(candidate_tracks, local_tracks)
+            penalty = 12 if difference <= .15 else 24 if difference <= .4 else 38
+            score -= penalty
+            notes.append(f"{candidate_tracks} tracks vs local {local_tracks}")
+    if candidate_discs and local_discs:
+        if candidate_discs == local_discs:
+            score += 10
+        else:
+            score -= 18
+            notes.append(f"{candidate_discs} discs vs local {local_discs}")
+    kind = release_type(release)
+    if kind.casefold() == "album":
+        score += 8
+    elif kind.casefold() == "single" and local_tracks > 2:
+        score -= 30
+        notes.append("single conflicts with album-sized source")
+    elif kind:
+        score -= 8
+        notes.append(f"type {kind}")
+    edition_text = " ".join(str(release.get(name) or "") for name in ("title", "disambiguation", "packaging")).casefold()
+    for clue in group.edition_clues:
+        if clue in edition_text:
+            score += 8
+        elif clue in {"tour edition", "expanded edition", "deluxe edition", "live", "instrumental"}:
+            score -= 12
+            notes.append(f"local clue '{clue}' absent")
+    return max(0, min(100, score)), notes
 
 
 def proposed_album_dir(group: AlbumGroup) -> str:
@@ -475,7 +567,7 @@ def print_review(groups: list[AlbumGroup], library_root: Path, multidisc: bool, 
     print()
     print("Digital import review")
     for idx, group in enumerate(groups, 1):
-        formats = ", ".join(f"{ext}:{count}" for ext, count in sorted(Counter(t.extension for t in group.tracks).items()))
+        formats = ", ".join(f"{ext.lstrip('.').upper()} {count}" for ext, count in sorted(Counter(t.extension for t in group.tracks).items()))
         missing = sorted(
             {
                 field
@@ -491,34 +583,57 @@ def print_review(groups: list[AlbumGroup], library_root: Path, multidisc: bool, 
             }
         )
         prefix = "SKIP " if group.skip else ""
-        print(f"{idx}) {prefix}{group.album_artist} - {group.album} ({group.year or 'year unknown'})")
-        codec_names = ", ".join(sorted({track.codec for track in group.tracks if track.codec})) or "unknown"
+        print(f"{idx}) {prefix}{group.album_artist}")
+        print(f"   Album  : {group.album} ({group.year or 'year unknown'})")
+        if group.edition_clues:
+            print(f"   Edition: {', '.join(group.edition_clues)}")
+        codec_names = ", ".join(sorted({track.codec.upper() for track in group.tracks if track.codec})) or "unknown"
         bitrates = sorted({track.bitrate for track in group.tracks if track.bitrate})
         sample_rates = sorted({track.sample_rate for track in group.tracks if track.sample_rate})
-        audio_detail = f"   Audio  : {codec_names}"
+        audio_detail = f"   Format : {codec_names}"
         if bitrates:
-            audio_detail += ", " + "/".join(f"{rate // 1000} kb/s" for rate in bitrates)
+            bitrate_range = f"~{bitrates[0] // 1000} kb/s" if len(bitrates) == 1 else f"{bitrates[0] // 1000}-{bitrates[-1] // 1000} kb/s"
+            audio_detail += f", {bitrate_range}"
         if sample_rates:
-            audio_detail += ", " + "/".join(f"{rate} Hz" for rate in sample_rates)
-        print(f"   Tracks : {len(group.tracks)}   Formats: {formats}")
+            rates = f"{sample_rates[0] / 1000:g} kHz" if len(sample_rates) == 1 else f"{sample_rates[0] / 1000:g}-{sample_rates[-1] / 1000:g} kHz"
+            audio_detail += f", {rates}"
+        print(f"   Tracks : {len(group.tracks)}   Discs: {max((t.disc or 1) for t in group.tracks)}   Files: {formats}")
         print(audio_detail)
         if any(track.compilation for track in group.tracks):
             print("   Type   : compilation flag present")
-        print(f"   Match  : {group.match_status}")
+        print(f"   Metadata: {group.match_status}")
         print(f"   Missing: {', '.join(missing) if missing else 'none'}")
         print(f"   Dest   : {library_root / proposed_album_dir(group)}")
-        discrepancies = []
-        for track in group.tracks:
-            if track.embedded_artist and track.folder_artist_hint and track.embedded_artist.casefold() != track.folder_artist_hint.casefold():
-                discrepancies.append(f"{track.rel_source}: tagged artist '{track.embedded_artist}' vs folder '{track.folder_artist_hint}'")
-            if track.embedded_album and track.folder_album_hint and track.embedded_album.casefold() != track.folder_album_hint.casefold():
-                discrepancies.append(f"{track.rel_source}: tagged album '{track.embedded_album}' vs folder '{track.folder_album_hint}'")
-        if discrepancies:
-            print("   Tag/path differences to review:")
-            for note in discrepancies[:8]:
-                print(f"     {note}")
-            if len(discrepancies) > 8:
-                print(f"     ... and {len(discrepancies) - 8} more")
+        discrepancies = grouped_discrepancies(group)
+        for label, folder_value, tag_value, affected in discrepancies:
+            print(f"   Folder/tag discrepancy ({affected}/{len(group.tracks)}):")
+            print(f"     Folder-derived {label}: {folder_value}")
+            print(f"     Embedded {label.title()}: {tag_value}")
+
+
+def grouped_discrepancies(group: AlbumGroup) -> list[tuple[str, str, str, int]]:
+    counts: Counter[tuple[str, str, str]] = Counter()
+    for track in group.tracks:
+        if track.embedded_artist and track.folder_artist_hint and track.embedded_artist.casefold() != track.folder_artist_hint.casefold():
+            counts[("artist", track.folder_artist_hint, track.embedded_artist)] += 1
+        if track.embedded_album and track.folder_album_hint and track.embedded_album.casefold() != track.folder_album_hint.casefold():
+            counts[("release", track.folder_album_hint, track.embedded_album)] += 1
+    return [(label, folder, tagged, affected) for (label, folder, tagged), affected in counts.most_common()]
+
+
+def print_candidates(group: AlbumGroup) -> None:
+    print(f"\nMusicBrainz candidates for {group.album_artist} - {group.album}")
+    if not group.provider_candidates:
+        print("  No provider candidates were retained. Current local metadata remains proposed.")
+        return
+    for index, release in enumerate(group.provider_candidates[:5], 1):
+        print("  " + candidate_summary(release, group, index).replace("; ", "\n     "))
+
+
+def print_track_mappings(group: AlbumGroup, library_root: Path) -> None:
+    print(f"\nTrack mappings for {group.album_artist} - {group.album}")
+    for track in group.tracks:
+        print(f"  {track.rel_source} -> {library_root / track.proposed_rel}")
 
 
 def edit_album(group: AlbumGroup) -> None:
@@ -556,7 +671,7 @@ def interactive_review(groups: list[AlbumGroup], library_root: Path, multidisc: 
     while True:
         print_review(groups, library_root, multidisc, include_track_artist)
         print()
-        choice = input("Import options: [A]ccept all, [S]kip album, [E]dit album, edit [T]rack, [Q]uit: ").strip().lower()
+        choice = input("Import options: [A]pprove current local metadata for all, [E]dit album, edit [T]rack, [C]andidates, [V]iew mappings, [S]kip, [Q]uit: ").strip().lower()
         if choice in {"", "a", "accept", "accept all"}:
             return True
         if choice in {"q", "quit", "abort"}:
@@ -573,8 +688,17 @@ def interactive_review(groups: list[AlbumGroup], library_root: Path, multidisc: 
             group = choose_group(groups)
             if group:
                 edit_track(group)
+        elif choice in {"c", "candidates"}:
+            group = choose_group(groups)
+            if group:
+                print_candidates(group)
+        elif choice in {"v", "view", "mappings"}:
+            group = choose_group(groups)
+            if group:
+                assign_destinations(groups, multidisc, include_track_artist)
+                print_track_mappings(group, library_root)
         else:
-            print("Please choose A, S, E, T, or Q.")
+            print("Please choose A, E, T, C, V, S, or Q.")
 
 
 def choose_group(groups: list[AlbumGroup]) -> AlbumGroup | None:
@@ -585,7 +709,10 @@ def choose_group(groups: list[AlbumGroup]) -> AlbumGroup | None:
     return None
 
 
-def stage_import(groups: list[AlbumGroup], stage: Path, source_root: Path, multidisc: bool, include_track_artist: bool) -> dict[str, Any]:
+def stage_import(
+    groups: list[AlbumGroup], stage: Path, source_root: Path, multidisc: bool, include_track_artist: bool, *,
+    copy_media: bool = True, library_root: Path | None = None,
+) -> dict[str, Any]:
     assign_destinations(groups, multidisc, include_track_artist)
     copied = 0
     skipped = 0
@@ -595,25 +722,31 @@ def stage_import(groups: list[AlbumGroup], stage: Path, source_root: Path, multi
             skipped += len(group.tracks)
             status(f"Skipping album: {group.album_artist} - {group.album}")
             continue
-        status(f"Staging album: {group.album_artist} - {group.album} ({len(group.tracks)} track(s))")
+        if copy_media:
+            status(f"Staging album: {group.album_artist} - {group.album} ({len(group.tracks)} track(s))")
         album_dir = stage / proposed_album_dir(group)
         artifact_dir = album_dir / ARTIFACT_DIR_NAME
-        artifact_dir.mkdir(parents=True, exist_ok=True)
+        if copy_media:
+            artifact_dir.mkdir(parents=True, exist_ok=True)
         album_tracks = []
         for track in group.tracks:
-            target = stage / track.proposed_rel
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(track.source, target)
-            copied += 1
             source_size = track.source.stat().st_size
-            staged_size = target.stat().st_size
+            staged_size = 0
+            if copy_media:
+                target = stage / track.proposed_rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(track.source, target)
+                copied += 1
+                staged_size = target.stat().st_size
             album_tracks.append({
                 "source": track.rel_source,
+                "source_path": str(track.source),
                 "destination": track.proposed_rel,
+                "destination_path": str((library_root / track.proposed_rel) if library_root else track.proposed_rel),
                 "readable": track.readable,
                 "source_size_bytes": source_size,
                 "staged_size_bytes": staged_size,
-                "verified_size_match": source_size == staged_size,
+                "verified_size_match": source_size == staged_size if copy_media else None,
                 "embedded_artist": track.embedded_artist,
                 "folder_artist_hint": track.folder_artist_hint,
                 "embedded_album": track.embedded_album,
@@ -623,7 +756,8 @@ def stage_import(groups: list[AlbumGroup], stage: Path, source_root: Path, multi
                 "sample_rate": track.sample_rate,
                 "compilation": track.compilation,
             })
-        copy_album_cover(source_root, group, album_dir, artifact_dir)
+        if copy_media:
+            copy_album_cover(source_root, group, album_dir, artifact_dir)
         albums.append(
             {
                 "album_artist": group.album_artist,
@@ -632,17 +766,23 @@ def stage_import(groups: list[AlbumGroup], stage: Path, source_root: Path, multi
                 "musicbrainz_releaseid": group.musicbrainz_releaseid,
                 "musicbrainz_releasegroupid": group.musicbrainz_releasegroupid,
                 "match_status": group.match_status,
+                "match_confidence": group.match_confidence,
+                "edition_clues": group.edition_clues,
                 "tracks": album_tracks,
             }
         )
     manifest = {
         "source_root": str(source_root),
+        "library_root": str(library_root) if library_root else "",
         "staged_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "staging_performed": copy_media,
+        "planned_tracks": sum(len(album["tracks"]) for album in albums),
+        "staged_bytes": sum(track["staged_size_bytes"] for album in albums for track in album["tracks"]),
         "copied_tracks": copied,
         "skipped_tracks": skipped,
         "albums": albums,
     }
-    for album in albums:
+    for album in albums if copy_media else []:
         artifact_dir = stage / sanitize_component(album["album_artist"]) / sanitize_component(
             f'{album["album"]} ({album["year"]})' if album["year"] else album["album"]
         ) / ARTIFACT_DIR_NAME
@@ -718,7 +858,7 @@ def album_info_from_dir(album_dir: Path, library_root: Path) -> dict[str, str]:
     return {"album_artist": artist, "album": album, "year": year, "musicbrainz_releaseid": "", "musicbrainz_releasegroupid": ""}
 
 
-def musicbrainz_release_details(release: dict[str, Any], local_score: int) -> str:
+def musicbrainz_release_details(release: dict[str, Any], compatibility: int, warnings: list[str] | None = None) -> str:
     artist_credit = release.get("artist-credit") or release.get("artist_credit") or []
     artists = []
     for item in artist_credit:
@@ -742,7 +882,7 @@ def musicbrainz_release_details(release: dict[str, Any], local_score: int) -> st
         release_types.extend(str(value) for value in secondary)
     if release_types:
         details.append("type " + "/".join(release_types))
-    edition = [str(value) for value in (release.get("disambiguation"), release.get("packaging")) if value]
+    edition = [str(value) for value in (release.get("disambiguation"), release.get("packaging")) if value and str(value).casefold() != "none"]
     if edition:
         details.append("edition " + ", ".join(edition))
     media = release.get("media") or []
@@ -774,14 +914,21 @@ def musicbrainz_release_details(release: dict[str, Any], local_score: int) -> st
         details.append("catalogue " + ", ".join(dict.fromkeys(catalogue_numbers)))
     if release.get("barcode"):
         details.append("barcode " + str(release["barcode"]))
-    provider_score = release.get("score")
-    if provider_score is not None:
-        details.append(f"MusicBrainz confidence {provider_score}/100")
-    details.append(f"local match {local_score}/10")
+    details.append(f"local compatibility {compatibility}%")
+    if warnings:
+        details.append("warning " + ", ".join(warnings))
     return "; ".join(details)
 
 
-def find_musicbrainz_release(album_artist: str, album: str, year: str, last_request: float) -> tuple[str, str, str, float]:
+def candidate_summary(release: dict[str, Any], group: AlbumGroup, rank: int) -> str:
+    compatibility, warnings = release_compatibility(group, release)
+    details = musicbrainz_release_details(release, compatibility, warnings)
+    return f"{rank}. {details}"
+
+
+def find_musicbrainz_release(
+    album_artist: str, album: str, year: str, last_request: float, *, group: AlbumGroup | None = None
+) -> tuple[str, str, str, float]:
     if not album or album == "Unknown Album":
         return "", "", "not enough metadata", last_request
 
@@ -802,22 +949,26 @@ def find_musicbrainz_release(album_artist: str, album: str, year: str, last_requ
             data = musicbrainz_json(url)
         except Exception as exc:
             return "", "", f"lookup failed: {exc}", last_request
-        group = AlbumGroup(key="", album_artist=album_artist, album=album, year=attempt_year)
+        local_group = group or AlbumGroup(key="", album_artist=album_artist, album=album, year=attempt_year)
         releases = data.get("releases", []) or []
         if not releases:
             last_status = "no MusicBrainz match"
             continue
-        ranked = sorted(releases, key=lambda r: release_score(group, r), reverse=True)
-        best_score = release_score(group, ranked[0])
-        if best_score < 8:
-            last_status = "weak MusicBrainz match ignored; exact title and artist evidence required"
+        ranked = sorted(releases, key=lambda r: release_compatibility(local_group, r)[0], reverse=True)
+        best_score, best_notes = release_compatibility(local_group, ranked[0])
+        if group is not None:
+            group.provider_candidates = ranked[:5]
+            group.match_confidence = best_score
+        if best_score < 55:
+            last_status = "weak MusicBrainz compatibility; local metadata retained"
             continue
-        tied = [release for release in ranked if release_score(group, release) == best_score]
-        if len(tied) > 1:
-            summaries = [musicbrainz_release_details(release, best_score) for release in tied[:5]]
-            return "", "", f"ambiguous MusicBrainz editions; review candidates: {' | '.join(summaries)}", last_request
+        tied = [release for release in ranked if release_compatibility(local_group, release)[0] == best_score]
+        # A candidate needs a meaningful lead over the next edition before it can identify a release.
+        second_score = release_compatibility(local_group, ranked[1])[0] if len(ranked) > 1 else -1
+        if len(tied) > 1 or (second_score >= best_score - 8):
+            return "", "", f"ambiguous MusicBrainz editions; best local compatibility {best_score}%", last_request
         best = tied[0]
-        status_text = "unique MusicBrainz candidate; " + musicbrainz_release_details(best, best_score)
+        status_text = "MusicBrainz candidate; " + musicbrainz_release_details(best, best_score, best_notes)
         if year and not attempt_year:
             status_text = "MusicBrainz candidate after retry without folder year; " + musicbrainz_release_details(best, best_score)
         return str(best.get("id") or ""), release_group_id(best), status_text, last_request
@@ -1032,14 +1183,21 @@ def cmd_import(args: argparse.Namespace) -> int:
     if not interactive_review(groups, library_root, args.multidisc == "yes", args.include_track_artist == "yes"):
         print("Import aborted before staging.")
         return 4
-    manifest = stage_import(groups, stage, source, args.multidisc == "yes", args.include_track_artist == "yes")
+    manifest = stage_import(
+        groups, stage, source, args.multidisc == "yes", args.include_track_artist == "yes",
+        copy_media=args.mode == "apply", library_root=library_root,
+    )
     print("\nSafe publication plan (source -> destination):")
     for album in manifest["albums"]:
         album_name = f'{album["album"]} ({album["year"]})' if album.get("year") else album["album"]
         print(f'  {album["album_artist"]} - {album_name}; {len(album["tracks"])} track(s)')
         print(f'    MusicBrainz: {album["match_status"]}')
-        for track in album["tracks"]:
+        displayed_tracks = album["tracks"][:3]
+        for track in displayed_tracks:
             print(f'    {source / track["source"]} -> {library_root / track["destination"]}')
+        remaining = len(album["tracks"]) - len(displayed_tracks)
+        if remaining:
+            print(f"    ... {remaining} more mapping(s); use [V]iew mappings during review to inspect every path.")
     approved = False
     if args.mode == "apply" and manifest["copied_tracks"]:
         try:
@@ -1050,8 +1208,13 @@ def cmd_import(args: argparse.Namespace) -> int:
             print(f"Publication cancelled. Staged files remain at: {stage}")
     manifest["mode"] = args.mode
     manifest["approved_to_publish"] = approved
+    manifest["publication"] = "copy"
+    manifest["source_lifecycle"] = "preserved"
     Path(args.result_file).write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-    print(f"Staged {manifest['copied_tracks']} digital track(s) in: {stage}")
+    if args.mode == "dry-run":
+        print("Plan recorded without staging media.")
+    else:
+        print(f"Staged {manifest['copied_tracks']} digital track(s) in: {stage}")
     if manifest["skipped_tracks"]:
         print(f"Skipped {manifest['skipped_tracks']} track(s).")
     return 0
