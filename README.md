@@ -4,12 +4,14 @@
 
 ## Install and configure
 
-The commissioned server command is installed at `~/.local/bin/music-ingest` and works from any directory. The checkout remains the source of the scripts. A TOML file at `~/.config/music-ingest/config.toml` holds paths and conservative policy:
+Expose the `music-ingest` command on your `PATH`; it works from any directory.
+The checkout remains the source of the scripts. A TOML file at
+`~/.config/music-ingest/config.toml` holds paths and conservative policy:
 
 ```toml
-incoming = "/srv/data/ingest/music"
-library = "/srv/data/media/Music"
-staging = "/srv/data/ingest/.music-ingest-staging"
+incoming = "/path/to/incoming/music"
+library = "/path/to/library/Music"
+staging = "/path/to/staging/music-ingest"
 default_mode = "dry-run"
 publication = "copy"
 preserve_source = true
@@ -18,11 +20,11 @@ multidisc_folders = false
 cover_mode = "file"
 ```
 
-Inspect effective values with `music-ingest config`. The command refuses to create a missing production root and checks that source and library roots do not overlap. CLI options such as `--incoming`, `--library`, `--staging`, and digital `--mode` override configuration. Staging is configurable; the commissioned directory is on the same `/srv/data` ext4 filesystem as the library, avoiding large temporary media on the OS filesystem.
+Inspect effective values with `music-ingest config`. The command refuses to create a missing production root and checks that source and library roots do not overlap. CLI options such as `--incoming`, `--library`, `--staging`, and digital `--mode` override configuration. Keep staging on the same filesystem as the library so large temporary media does not consume the OS filesystem.
 
 Runtime requirements are Python 3.11+ (standard library only), Bash, `ffprobe` (provided by FFmpeg), `flac`/`metaflac`, and standard GNU/Linux utilities. CD ripping additionally requires Whipper, `cd-paranoia`, `cdrdao`, `eject`, and access to an optical drive. The Ubuntu Whipper package supplies its Python libraries and related dependencies. Run the synthetic suite with `python3 -m unittest discover -s tests`. Artwork lookup uses Python's standard library and network requests only when explicitly requested from the cover-art menu. MusicBrainz lookup is optional and can be disabled in config.
 
-On RP-Server-02 the media tools are in `~/.local/opt/music-ingest-runtime`, assembled from official Ubuntu 26.04 `.deb` packages and activated by the user-level command/legacy wizard. Their exact versions are listed in `PACKAGES.txt` in that runtime. This per-user extraction does not register packages in dpkg or receive automatic OS package updates; use normal apt installation where administrator access is available and keep the inventory current when refreshing this runtime.
+Use normal system package management to install the CD-ripping dependencies where administrator access is available. If a user-local runtime is unavoidable, document its provenance and update process locally: it will not be tracked by the system package manager or receive automatic OS package updates.
 
 ## Digital import
 
@@ -42,4 +44,4 @@ Choose CD ripping from the menu or run `music-ingest cd`. The legacy Whipper wiz
 
 `bin/whipper-music-wizard` and `bin/whipper-plex-wizard` remain available and activate the user-local runtime when it exists. Do not run as root. The project does not watch directories, alter Jellyfin, configure mounts, delete incoming files, or manage backups. Jellyfin sees the production media tree read-only; library discovery/playback is a separate check. Backups cover the production media tree according to the server's backup policy, not incoming files.
 
-See the server runbook for verified deployment paths, staging, dependencies, and recovery notes.
+Keep deployment-specific paths, staging choices, dependency workarounds, and recovery notes in local operational documentation rather than this public repository.

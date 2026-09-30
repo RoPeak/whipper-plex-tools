@@ -1137,7 +1137,7 @@ def cmd_covers(args: argparse.Namespace) -> int:
         print()
         print("No album folders were found. Check that the selected directory contains album folders with audio files.")
         print("For an artist import, this is usually the artist directory, for example:")
-        print("  /home/ronan/Music/Elliott Smith")
+        print("  /path/to/Music/Example Artist")
     downloaded = 0
     skipped = 0
     failed = 0

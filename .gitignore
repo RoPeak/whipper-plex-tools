@@ -4,3 +4,14 @@ docs/
 Last-Whipper-Run-Output.txt
 __pycache__/
 *.py[cod]
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
