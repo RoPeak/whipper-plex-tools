@@ -153,6 +153,32 @@ run_logged() {
   return "$status"
 }
 
+# Offset discovery can legitimately spend a long time reading one candidate.
+# Keep its complete diagnostic output, but give the operator an honest heartbeat
+# rather than looking hung.  It never imposes a timeout or kills a slow drive.
+run_offset_find_logged() {
+  local log_file="$1" device="$2" offsets="$3" line pipe pid status started offset_fd
+  pipe="$(mktemp -u -t whipper-offset-stream-XXXXXX)"
+  mkfifo -- "$pipe"
+  : > "$log_file"
+  started="$(date +%s)"
+  whipper offset find -d "$device" -o "$offsets" >"$pipe" 2>&1 & pid=$!
+  exec {offset_fd}<"$pipe"
+  while true; do
+    if IFS= read -r -t 15 -u "$offset_fd" line; then
+      printf '%s\n' "$line" | tee -a "$log_file"
+      last_output="$(date +%s)"
+    else
+      if ! kill -0 "$pid" 2>/dev/null; then break; fi
+      echo "Still testing drive offset candidates... Elapsed $(( ($(date +%s) - started) / 60 ))m."
+    fi
+  done
+  wait "$pid"; status=$?
+  exec {offset_fd}<&-
+  rm -f -- "$pipe"
+  return "$status"
+}
+
 looks_like_cover_art_network_failure() {
   local log_file="$1"
 
@@ -659,7 +685,7 @@ drive_setup() {
       read -r
       local offset_log
       offset_log="$(mktemp -t whipper-offset-XXXXXX.log)"
-      if run_logged "$offset_log" whipper offset find -d "$DEVICE" -o "$SAFE_OFFSET_SEARCH" && offset_find_confirmed "$offset_log"; then
+      if run_offset_find_logged "$offset_log" "$DEVICE" "$SAFE_OFFSET_SEARCH" && offset_find_confirmed "$offset_log"; then
         rm -f -- "$offset_log"
         say_status "✔ Done (confirmed offsets are saved into whipper.conf automatically)."
       else
@@ -686,7 +712,7 @@ drive_setup() {
       read -r
       local offset_log
       offset_log="$(mktemp -t whipper-offset-XXXXXX.log)"
-      if run_logged "$offset_log" whipper offset find -d "$DEVICE" -o "$off" && offset_find_confirmed "$offset_log"; then
+      if run_offset_find_logged "$offset_log" "$DEVICE" "$off" && offset_find_confirmed "$offset_log"; then
         rm -f -- "$offset_log"
         say_status "✔ Done (confirmed offsets are saved into whipper.conf automatically)."
       else
@@ -2162,6 +2188,9 @@ main_menu() {
 }
 
 load_cfg
+if [[ -n "${MUSIC_INGEST_DEVICE:-}" ]]; then
+  DEVICE="$MUSIC_INGEST_DEVICE"
+fi
 OUT_ROOT="${MUSIC_INGEST_LIBRARY:-$OUT_ROOT}"
 MULTIDISC="${MUSIC_INGEST_MULTIDISC:-$MULTIDISC}"
 COVER_MODE="${MUSIC_INGEST_COVER_MODE:-$COVER_MODE}"

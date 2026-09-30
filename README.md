@@ -38,7 +38,7 @@ Reports include the exact source path, final destination, lifecycle, approval, v
 
 ## Audio CD workflow
 
-Choose CD ripping from the menu or run `music-ingest cd`. The legacy Whipper wizard handles drive detection/setup, MusicBrainz release selection, secure ripping/AccurateRip where supported, cover handling, damaged-disc recovery, and additive repair. Rips stage before publication; the wizard lists every staged-to-library path and requires typing `APPLY` before publication. Declining retains the staged rip for later review. Conflicts do not overwrite existing tracks. If the drive, Whipper, or media utilities are unavailable, the CD path reports that condition and digital import remains usable. No optical-drive availability is inferred from package installation alone.
+Choose CD ripping from the menu or run `music-ingest cd --device /dev/sr0` for a session-specific device. The legacy Whipper wizard handles drive detection/setup, MusicBrainz release selection, secure ripping/AccurateRip where supported, cover handling, damaged-disc recovery, and additive repair. Rips stage before publication; the wizard lists every staged-to-library path and requires typing `APPLY` before publication. Declining retains the staged rip for later review. Conflicts do not overwrite existing tracks. If the drive, Whipper, or media utilities are unavailable, the CD path reports that condition and digital import remains usable. No optical-drive availability is inferred from package installation alone. Offset discovery never assumes an offset or applies a timeout; it retains its normal output and prints a heartbeat while a slow candidate is still running.
 
 ## Compatibility and operation
 
