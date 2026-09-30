@@ -1595,7 +1595,7 @@ rip_cd() {
     local log_file="$1"
     local allow_prompt="$2"
     shift 2
-    local line status pid yn pipe
+    local line status pid yn pipe read_fd
     local q_errors q_track q_total=0 q_prompted="no"
     BAD_DISC_ABORTED="no"
     : > "$log_file"
@@ -1608,7 +1608,10 @@ rip_cd() {
     set +e
     "$@" >"$pipe" 2>&1 &
     pid=$!
-    while IFS= read -r line < "$pipe"; do
+    # Open the FIFO once.  Reopening it for each `read` blocks forever after
+    # the writer has emitted its final line and exited (the observed CD-R hang).
+    exec {read_fd}<"$pipe"
+    while IFS= read -r -u "$read_fd" line; do
       printf '%s\n' "$line" | tee -a "$log_file"
       if [[ "$allow_prompt" == "yes" && "$q_prompted" == "no" && "$line" =~ Track[[:space:]]+([0-9]+)[[:space:]]+finished,[[:space:]]+found[[:space:]]+([0-9]+)[[:space:]]+Q[[:space:]]sub-channels[[:space:]]with[[:space:]]CRC[[:space:]]errors ]]; then
         q_track="${BASH_REMATCH[1]}"
@@ -1631,6 +1634,7 @@ rip_cd() {
         fi
       fi
     done
+    exec {read_fd}<&-
     wait "$pid"
     status=$?
     set -e
