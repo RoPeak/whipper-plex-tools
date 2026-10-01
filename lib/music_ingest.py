@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tomllib
+import time
 from pathlib import Path
 
 APP_DIR = Path(__file__).resolve().parents[1]
@@ -67,16 +68,47 @@ def staging_size(path: Path) -> int:
     return sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
 
 
+def staging_file_count(path: Path) -> int:
+    return sum(1 for item in path.rglob("*") if item.is_file())
+
+
+def managed_staging_dirs(config: dict[str, object]) -> list[Path]:
+    """Return only immediate, tool-owned staging directories in known roots."""
+    roots = [Path(str(config["staging"])).resolve()]
+    incoming = Path(str(config["incoming"])).resolve()
+    if incoming not in roots:
+        roots.append(incoming)
+    found: list[Path] = []
+    for root in roots:
+        found.extend(owned_staging_dirs(root))
+    return sorted(set(found))
+
+
+def staging_classification(entry: Path) -> str:
+    # A directory alone cannot prove publication.  Keep all historical output
+    # conservative until a future operation has an explicit retained marker.
+    if not entry.exists():
+        return "unknown"
+    if entry.name.startswith("whipper-out-"):
+        return "partial/unknown"
+    return "unknown"
+
+
 def staging_command(config: dict[str, object], action: str) -> int:
     staging = Path(str(config["staging"])).resolve()
-    entries = owned_staging_dirs(staging)
+    entries = managed_staging_dirs(config)
     if action == "status":
         print(f"Staging: {staging}")
         if not entries:
             print("No tool-owned staged operations found.")
             return 0
         for entry in entries:
-            print(f"{entry.name}: {staging_size(entry)} bytes")
+            age = max(0, int(time.time() - entry.stat().st_mtime))
+            print(
+                f"{entry}: {staging_classification(entry)}; "
+                f"age={age}s; files={staging_file_count(entry)}; bytes={staging_size(entry)}; "
+                "report=not linked"
+            )
         return 0
     if action == "cleanup":
         if not entries:
@@ -84,7 +116,7 @@ def staging_command(config: dict[str, object], action: str) -> int:
             return 0
         print("The following tool-owned staging directories will be removed:")
         for entry in entries:
-            print(f"  {entry} ({staging_size(entry)} bytes)")
+            print(f"  {entry} ({staging_classification(entry)}; {staging_file_count(entry)} files; {staging_size(entry)} bytes)")
         try:
             approved = input("Type CLEANUP to remove only these staged directories: ").strip() == "CLEANUP"
         except (EOFError, KeyboardInterrupt):
@@ -94,7 +126,7 @@ def staging_command(config: dict[str, object], action: str) -> int:
             return 0
         for entry in entries:
             # Re-check parent/name immediately before removal; never traverse arbitrary paths.
-            if entry.parent == staging and entry.name.startswith(STAGING_PREFIXES):
+            if entry.parent in {staging, Path(str(config["incoming"])).resolve()} and entry.name.startswith(STAGING_PREFIXES):
                 shutil.rmtree(entry)
         print("Tool-owned staging cleanup complete.")
         return 0
