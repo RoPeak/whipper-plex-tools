@@ -1967,7 +1967,7 @@ import_digital_music() {
   ensure_digital_import_deps || return 1
   mkdir -p "$OUT_ROOT"
 
-  local source stage result status kept_paths="" start_time dirs=() audio_count=0
+  local source stage stage_root result status kept_paths="" start_time dirs=() audio_count=0
   SESSION_PUBLISHED_FILES=0
   SESSION_CONFLICTS=0
   start_time="$(date +%s)"
@@ -1997,12 +1997,15 @@ import_digital_music() {
     return 1
   fi
 
+  # Keep temporary import output on the selected library filesystem by default.
+  # An explicitly configured staging root still takes precedence.
+  stage_root="${MUSIC_INGEST_STAGING:-$OUT_ROOT/.music-ingest-staging}"
   if [[ "${MUSIC_INGEST_MODE:-dry-run}" == "apply" ]]; then
-    mkdir -p -- "${MUSIC_INGEST_STAGING:?MUSIC_INGEST_STAGING is required}"
-    stage="$(mktemp -d "${MUSIC_INGEST_STAGING%/}/music-import-out-XXXXXX")"
+    mkdir -p -- "$stage_root"
+    stage="$(mktemp -d "${stage_root%/}/music-import-out-XXXXXX")"
   else
     # The planner validates the path and writes only its report in dry-run mode.
-    stage="${MUSIC_INGEST_STAGING%/}/music-import-dry-run-no-media"
+    stage="${stage_root%/}/music-import-dry-run-no-media"
   fi
   result="$(mktemp -t music-import-result-XXXXXX.json)"
 
