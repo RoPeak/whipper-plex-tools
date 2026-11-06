@@ -167,7 +167,6 @@ run_offset_find_logged() {
   while true; do
     if IFS= read -r -t 15 -u "$offset_fd" line; then
       printf '%s\n' "$line" | tee -a "$log_file"
-      last_output="$(date +%s)"
     else
       if ! kill -0 "$pid" 2>/dev/null; then break; fi
       echo "Still testing drive offset candidates... Elapsed $(( ($(date +%s) - started) / 60 ))m."
@@ -1349,6 +1348,15 @@ publish_digital_import_output() {
   done
 
   if ((${#conflicts[@]} > 0)); then
+    for src in "${files[@]}"; do
+      rel="${src#"$stage"/}"
+      local action="failed"
+      local conflict
+      for conflict in "${conflicts[@]}"; do
+        [[ "$rel" == "$conflict" ]] && action="conflicting" && break
+      done
+      printf '%s\t%s\n' "$action" "$rel" >> "${DIGITAL_PUBLICATION_OUTCOMES:?}"
+    done
     echo
     echo "✘ Fail: Not copying this digital import because these existing files differ:"
     printf '  %s\n' "${conflicts[@]}"
@@ -1365,10 +1373,19 @@ publish_digital_import_output() {
     rel="${src#"$stage"/}"
     target="$dest/$rel"
     if [[ -e "$target" ]]; then
+      if [[ "$rel" == */.library-import/* ]]; then
+        printf 'generated-auxiliary\t%s\n' "$rel" >> "${DIGITAL_PUBLICATION_OUTCOMES:?}"
+      else
+        printf 'verified-existing-duplicate\t%s\n' "$rel" >> "${DIGITAL_PUBLICATION_OUTCOMES:?}"
+      fi
       continue
     fi
     mkdir -p "$(dirname "$target")"
-    publish_file_atomic "$src" "$target" || return 1
+    if ! publish_file_atomic "$src" "$target"; then
+      printf 'failed\t%s\n' "$rel" >> "${DIGITAL_PUBLICATION_OUTCOMES:?}"
+      return 1
+    fi
+    printf 'published\t%s\n' "$rel" >> "${DIGITAL_PUBLICATION_OUTCOMES:?}"
     ((copied += 1))
   done
 
@@ -1917,13 +1934,13 @@ write_digital_report() {
   local result="$1" outcome="$2" stage="$3"
   local report_dir="${XDG_STATE_HOME:-$HOME/.local/state}/music-ingest/reports"
   mkdir -p "$report_dir" || { echo "Warning: could not create report directory $report_dir"; return 0; }
-  python3 - "$result" "$report_dir" "$outcome" "$stage" "${SESSION_PUBLISHED_FILES:-0}" "${SESSION_CONFLICTS:-0}" <<'PYREPORT'
+  python3 - "$result" "$report_dir" "$outcome" "$stage" "${SESSION_PUBLISHED_FILES:-0}" "${SESSION_CONFLICTS:-0}" "${DIGITAL_PUBLICATION_OUTCOMES:-}" <<'PYREPORT'
 import json, sys, time
 from pathlib import Path
 source, directory, outcome, stage = sys.argv[1:5]
 data = json.loads(Path(source).read_text(encoding="utf-8"))
 data["outcome"] = outcome
-data["report_schema"] = "music-ingest-publication-v1"
+data["report_schema"] = "music-ingest-publication-v2"
 data["staging"] = stage or None
 data["source_lifecycle"] = "preserved"
 data["published_file_count"] = int(sys.argv[5])
@@ -1939,10 +1956,35 @@ data["audio"] = {
     "published_tracks": data["published_track_count"], "skipped_or_conflicted_tracks": int(data.get("skipped_tracks", 0)),
 }
 auxiliary = []
+outcomes = {}
+outcome_path = Path(sys.argv[7]) if len(sys.argv) > 7 and sys.argv[7] else None
+if outcome_path and outcome_path.is_file():
+    for line in outcome_path.read_text(encoding="utf-8").splitlines():
+        action, separator, relative = line.partition("\t")
+        if separator and relative:
+            outcomes[relative] = action
+stage_root = Path(stage) if stage else None
+if stage_root and stage_root.is_dir():
+    for staged_file in stage_root.rglob("*"):
+        if staged_file.is_file():
+            outcomes.setdefault(str(staged_file.relative_to(stage_root)), "failed")
+items = []
+consumed = set()
+library_root = Path(data.get("library_root") or "/")
 for album in data.get("albums", []):
     artwork = album.get("artwork") or {}
     if artwork:
         auxiliary.append({"kind": "artwork", "status": artwork.get("status"), "mechanism": artwork.get("mechanism"), "source": artwork.get("source"), "destination": artwork.get("destination")})
+        if artwork.get("mechanism") == "local sidecar" and artwork.get("final_destination") and Path(str(artwork.get("source"))).is_absolute():
+            final_art = Path(str(artwork["final_destination"]))
+            try:
+                art_rel = str(final_art.relative_to(library_root))
+            except ValueError:
+                art_rel = ""
+            if art_rel:
+                action = outcomes.get(art_rel, "failed")
+                consumed.add(art_rel)
+                items.append({"kind":"local-artwork", "action":action, "source_lifecycle":"preserved", "source":artwork["source"], "destination":str(final_art), "verification":"byte-identical-copy" if action in {"published", "verified-existing-duplicate"} else "none"})
     album_dir = str(Path(album.get("tracks", [{}])[0].get("final_destination") or album.get("tracks", [{}])[0].get("destination_path") or "").parent)
     if album_dir:
         auxiliary.append({"kind": "import-manifest", "status": "published" if published else "not_published", "mechanism": "generated", "source": "", "destination": str(Path(album_dir) / ".library-import" / "IMPORT_MANIFEST.json")})
@@ -1954,8 +1996,17 @@ data["cleanup_eligible"] = bool(
 )
 for album in data.get("albums", []):
     for track in album.get("tracks", []):
-        track["publication_status"] = "published_or_verified_existing" if published else "not_published"
+        relative = str(track.get("destination") or "")
+        action = outcomes.get(relative, "failed")
+        consumed.add(relative)
+        track["publication_status"] = action
         track["final_destination"] = track.get("destination_path")
+        items.append({"kind":"audio", "action":action, "source_lifecycle":"preserved", "source":track.get("source_path"), "destination":track.get("final_destination"), "verification":"byte-identical-copy" if action in {"published", "verified-existing-duplicate"} else "none"})
+for relative, action in sorted(outcomes.items()):
+    if relative in consumed:
+        continue
+    items.append({"kind":"generated-auxiliary", "action":action if action in {"failed", "conflicting"} else "generated-auxiliary", "source_lifecycle":"not-applicable", "source":None, "destination":str(library_root / relative), "verification":"not-cleanup-evidence"})
+data["items"] = items
 data["reported_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
 target = Path(directory) / f"music-ingest-{time.strftime('%Y%m%d-%H%M%S')}-{__import__('os').getpid()}.json"
 target.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
@@ -2008,9 +2059,12 @@ import_digital_music() {
     stage="${stage_root%/}/music-import-dry-run-no-media"
   fi
   result="$(mktemp -t music-import-result-XXXXXX.json)"
+  DIGITAL_PUBLICATION_OUTCOMES="$(mktemp -t music-import-publication-XXXXXX.tsv)"
+  : > "$DIGITAL_PUBLICATION_OUTCOMES"
 
   cleanup_import_tmp() {
     [[ -n "${result:-}" && -f "$result" ]] && rm -f -- "$result"
+    [[ -n "${DIGITAL_PUBLICATION_OUTCOMES:-}" && -f "$DIGITAL_PUBLICATION_OUTCOMES" ]] && rm -f -- "$DIGITAL_PUBLICATION_OUTCOMES"
     if [[ -n "${stage:-}" && "${stage##*/}" == music-import-out-* && -z "${kept_paths:-}" ]]; then
       rm -rf -- "$stage"
     fi
@@ -2166,15 +2220,20 @@ print_digital_import_summary() {
     python3 - "$result_file" <<'PY'
 import json
 import sys
-from collections import Counter
-
 with open(sys.argv[1], encoding="utf-8") as handle:
     manifest = json.load(handle)
 albums = manifest.get("albums", [])
-matches = Counter(album.get("match_status", "unknown") for album in albums)
 print("  Albums reviewed:     %s" % len(albums))
-if matches:
-    print("  Metadata matches:    " + "; ".join("%s (%s)" % (name, count) for name, count in sorted(matches.items())))
+print("  Tracks planned/staged: %s/%s" % (manifest.get("planned_tracks", 0), manifest.get("copied_tracks", 0)))
+categories = {
+    "matched": sum(not album.get("review_risks") for album in albums),
+    "attention": sum(bool(album.get("review_risks")) for album in albums),
+    "unknown-year": sum("unknown-year" in (album.get("review_risks") or []) for album in albums),
+    "unreadable": sum("unreadable" in (album.get("review_risks") or []) for album in albums),
+    "folder/tag-conflict": sum(any(str(risk).startswith("folder/tag-conflict") for risk in (album.get("review_risks") or [])) for album in albums),
+    "weak/ambiguous": sum(any(risk in {"weak-match", "low-compatibility", "unmatched-or-ambiguous"} for risk in (album.get("review_risks") or [])) for album in albums),
+}
+print("  Metadata:            " + " | ".join(f"{name} {count}" for name, count in categories.items()))
 PY
   fi
   if [[ -n "${kept_paths:-}" ]]; then

@@ -16,9 +16,11 @@ from lib.music_import_planner import (
     download_deezer_cover,
     find_deezer_cover_url,
     edit_album,
+    album_risks,
     grouped_discrepancies,
     find_musicbrainz_release,
     group_tracks,
+    interactive_review,
     musicbrainz_json,
     musicbrainz_release_details,
     print_candidates,
@@ -38,6 +40,34 @@ def probe(tags):
 
 
 class MusicImportPlannerTests(unittest.TestCase):
+    def test_folder_year_is_used_only_when_consistent_and_tags_are_absent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "Artist" / "Album (1997)" / "01 - Song.flac"
+            path.parent.mkdir(parents=True); path.write_bytes(b"audio")
+            track = track_from_probe(path, root, probe({"artist":"Artist", "album":"Album", "track":"1"}))
+            self.assertEqual((track.year, track.year_source, track.folder_year_hint), ("1997", "folder", "1997"))
+            self.assertFalse(track.year_conflict)
+
+    def test_conflicting_folder_or_tag_year_requires_attention(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "Artist (2001)" / "Album (1997)" / "01 - Song.flac"
+            path.parent.mkdir(parents=True); path.write_bytes(b"audio")
+            track = track_from_probe(path, root, probe({"artist":"Artist", "album":"Album", "date":"1998", "track":"1"}))
+            group = group_tracks([track])[0]
+            self.assertEqual(track.year, "1998")
+            self.assertTrue(track.year_conflict)
+            self.assertIn("folder/tag-conflict: year", album_risks(group))
+
+    def test_bulk_review_requires_counted_phrase(self):
+        track = Track(Path("song.flac"), "song.flac", ".flac", title="Song", artist="Artist", album_artist="Artist", album="Album", year="2000", track=1, readable=True)
+        group = AlbumGroup("key", [track], artist="Artist", album_artist="Artist", album="Album", year="2000", match_status="embedded release id", musicbrainz_releaseid="id")
+        with patch("builtins.input", side_effect=["a", "wrong", "q"]):
+            self.assertFalse(interactive_review([group], Path("/library"), False, False))
+        with patch("builtins.input", side_effect=["a", "APPROVE ALL 1 ALBUMS"]):
+            self.assertTrue(interactive_review([group], Path("/library"), False, False))
+
     def test_tagged_album_uses_embedded_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

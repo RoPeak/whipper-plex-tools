@@ -63,6 +63,9 @@ class Track:
     proposed_rel: str = ""
     folder_artist_hint: str = ""
     folder_album_hint: str = ""
+    folder_year_hint: str = ""
+    year_source: str = "unknown"
+    year_conflict: bool = False
     embedded_artist: str = ""
     embedded_album: str = ""
     codec: str = ""
@@ -263,7 +266,13 @@ def track_from_probe(source: Path, root: Path, probe: dict[str, Any]) -> Track:
     parent_album = rel_parts[-3] if parent_disc and len(rel_parts) >= 3 else (rel_parts[-2] if len(rel_parts) >= 2 else "")
     parent_artist = (rel_parts[-4] if len(rel_parts) >= 4 else root.name) if parent_disc else (rel_parts[-3] if len(rel_parts) >= 3 else (root.name if len(rel_parts) >= 2 else ""))
     artist = first_tag(tags, "artist", "album_artist", "albumartist") or parent_artist
-    year = parse_year(first_tag(tags, "date", "year"))
+    embedded_year = parse_year(first_tag(tags, "date", "year"))
+    folder_years = {
+        value for value in (parse_year(part) for part in source.relative_to(root).parts[:-1]) if value
+    }
+    folder_year = next(iter(folder_years)) if len(folder_years) == 1 else ""
+    year = embedded_year or folder_year
+    year_conflict = len(folder_years) > 1 or bool(embedded_year and folder_year and embedded_year != folder_year)
     disc_from_tag = parse_number(first_tag(tags, "disc", "discnumber"))
     disc = parent_disc or disc_from_tag or disc_from_name or 1
     album = first_tag(tags, "album") or parent_album
@@ -299,6 +308,9 @@ def track_from_probe(source: Path, root: Path, probe: dict[str, Any]) -> Track:
         readable=bool(probe),
         folder_artist_hint=(rel_parts[-4] if len(rel_parts) >= 4 else "") if parent_disc else (rel_parts[-3] if len(rel_parts) >= 3 else ""),
         folder_album_hint=container_album or parent_album,
+        folder_year_hint=folder_year,
+        year_source="embedded" if embedded_year else ("folder" if folder_year else "unknown"),
+        year_conflict=year_conflict,
         embedded_artist=first_tag(tags, "album_artist", "albumartist", "album artist", "artist"),
         embedded_album=first_tag(tags, "album"),
         codec=str(audio_stream.get("codec_name") or source.suffix.lower().lstrip(".")),
@@ -602,7 +614,7 @@ def print_review(groups: list[AlbumGroup], library_root: Path, multidisc: bool, 
         print(audio_detail)
         if any(track.compilation for track in group.tracks):
             print("   Type   : compilation flag present")
-        print(f"   Metadata: {group.match_status}")
+        print(f"   Metadata: {metadata_category(group)}")
         print(f"   Missing: {', '.join(missing) if missing else 'none'}")
         print(f"   Dest   : {library_root / proposed_album_dir(group)}")
         artwork = describe_artwork(group, library_root)
@@ -613,6 +625,28 @@ def print_review(groups: list[AlbumGroup], library_root: Path, multidisc: bool, 
             print(f"   Folder/tag discrepancy ({affected}/{len(group.tracks)}):")
             print(f"     Folder-derived {label}: {folder_value}")
             print(f"     Embedded {label.title()}: {tag_value}")
+
+
+def metadata_category(group: AlbumGroup) -> str:
+    risks = album_risks(group)
+    if not risks:
+        return "matched"
+    categories = Counter(risk.split(":", 1)[0] for risk in risks)
+    return ", ".join(f"{name} {count}" if count > 1 else name for name, count in sorted(categories.items()))
+
+
+def album_risks(group: AlbumGroup) -> list[str]:
+    risks: list[str] = []
+    status_text = group.match_status.casefold()
+    if any(not track.readable for track in group.tracks): risks.append("unreadable")
+    if not group.year: risks.append("unknown-year")
+    if any(track.year_conflict for track in group.tracks): risks.append("folder/tag-conflict: year")
+    if grouped_discrepancies(group): risks.append("folder/tag-conflict: identity")
+    if any(word in status_text for word in ("not enough", "no match", "unmatched", "failed", "ambiguous", "not searched")):
+        risks.append("unmatched-or-ambiguous")
+    if group.provider_candidates and group.match_confidence < 70: risks.append("low-compatibility")
+    elif group.musicbrainz_releaseid and group.match_confidence and group.match_confidence < 80: risks.append("weak-match")
+    return risks
 
 
 def grouped_discrepancies(group: AlbumGroup) -> list[tuple[str, str, str, int]]:
@@ -674,10 +708,23 @@ def edit_track(group: AlbumGroup) -> None:
 def interactive_review(groups: list[AlbumGroup], library_root: Path, multidisc: bool, include_track_artist: bool) -> bool:
     while True:
         print_review(groups, library_root, multidisc, include_track_artist)
+        attention = [(index, group, album_risks(group)) for index, group in enumerate(groups, 1) if not group.skip and album_risks(group)]
+        print(f"\nAttention queue: {len(attention)} of {sum(not group.skip for group in groups)} album(s)")
+        for index, group, risks in attention:
+            print(f"  {index}) {group.album_artist} - {group.album}: {', '.join(risks)}")
         print()
         choice = input("Import options: [A]pprove current local metadata for all, [E]dit album, edit [T]rack, [C]andidates, [V]iew mappings, [S]kip, [Q]uit: ").strip().lower()
         if choice in {"", "a", "accept", "accept all"}:
-            return True
+            count = sum(not group.skip for group in groups)
+            phrase = f"APPROVE ALL {count} ALBUMS"
+            try:
+                approval = input(f"Type {phrase} to accept the current metadata and mappings: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                approval = ""
+            if approval == phrase:
+                return True
+            print("Bulk approval not confirmed; review remains open.")
+            continue
         if choice in {"q", "quit", "abort"}:
             return False
         if choice in {"s", "skip"}:
@@ -763,6 +810,8 @@ def stage_import(
         artwork = describe_artwork(group, library_root or stage)
         if copy_media:
             artwork = copy_album_cover(source_root, group, album_dir, artifact_dir, artwork)
+        if library_root and artwork.get("mechanism") == "local sidecar" and artwork.get("destination"):
+            artwork["final_destination"] = str(library_root / Path(artwork["destination"]).relative_to(stage))
         albums.append(
             {
                 "album_artist": group.album_artist,
@@ -772,6 +821,7 @@ def stage_import(
                 "musicbrainz_releasegroupid": group.musicbrainz_releasegroupid,
                 "match_status": group.match_status,
                 "match_confidence": group.match_confidence,
+                "review_risks": album_risks(group),
                 "edition_clues": group.edition_clues,
                 "artwork": artwork,
                 "tracks": album_tracks,
@@ -783,6 +833,7 @@ def stage_import(
         "staged_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "staging_performed": copy_media,
         "planned_tracks": sum(len(album["tracks"]) for album in albums),
+        "planned_albums": len(albums),
         "staged_bytes": sum(track["staged_size_bytes"] for album in albums for track in album["tracks"]),
         "copied_tracks": copied,
         "skipped_tracks": skipped,
@@ -1249,7 +1300,7 @@ def cmd_import(args: argparse.Namespace) -> int:
     manifest["source_lifecycle"] = "preserved"
     Path(args.result_file).write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     if args.mode == "dry-run":
-        print("Plan recorded without staging media.")
+        print(f"Plan recorded: {manifest['planned_tracks']} track(s) planned; 0 staged in dry-run mode.")
     else:
         print(f"Staged {manifest['copied_tracks']} digital track(s) in: {stage}")
     if manifest["skipped_tracks"]:
