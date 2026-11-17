@@ -1,14 +1,41 @@
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
-from contextlib import redirect_stdout
 
 from lib import music_ingest
+from lib.report_support import atomic_json_write, machine_instance_id
 
 
 class MusicIngestConfigTests(unittest.TestCase):
+    def test_report_support_publishes_complete_json_without_partial_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "report.json"
+            atomic_json_write(target, {"complete": True})
+            self.assertEqual(target.read_text(), '{\n  "complete": true\n}\n')
+            self.assertEqual(list(Path(tmp).glob("*.partial")), [])
+        self.assertRegex(machine_instance_id(), r"^[0-9a-f]{64}$")
+
+    def test_report_support_removes_partial_after_publish_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "report.json"
+            with (
+                patch("lib.report_support.os.replace", side_effect=OSError("injected")),
+                self.assertRaisesRegex(OSError, "injected"),
+            ):
+                atomic_json_write(target, {"complete": True})
+            self.assertFalse(target.exists())
+            self.assertEqual(list(Path(tmp).glob("*.partial")), [])
+
+    def test_version_is_exposed(self):
+        self.assertRegex(music_ingest.__version__, r"^\d+\.\d+\.\d+$")
+        with self.assertRaises(SystemExit) as raised, redirect_stdout(StringIO()) as output:
+            music_ingest.build_parser().parse_args(["--version"])
+        self.assertEqual(raised.exception.code, 0)
+        self.assertIn(music_ingest.__version__, output.getvalue())
+
     def test_cd_allow_cdr_is_explicit_session_option(self):
         args = music_ingest.build_parser().parse_args(["cd", "--allow-cdr"])
         self.assertTrue(args.allow_cdr)

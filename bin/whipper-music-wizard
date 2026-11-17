@@ -10,6 +10,8 @@ if [[ -d "$RUNTIME_DIR/usr/bin" ]]; then
   export LD_LIBRARY_PATH="$RUNTIME_DIR/usr/lib/x86_64-linux-gnu:$RUNTIME_DIR/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+MUSIC_INGEST_VERSION="$(<"$SCRIPT_DIR/../VERSION")"
+export MUSIC_INGEST_VERSION
 IMPORT_HELPER="$SCRIPT_DIR/../lib/music_import_planner.py"
 # shellcheck disable=SC1091 # SCRIPT_DIR is runtime-derived; the helper is also passed to ShellCheck directly.
 source "$SCRIPT_DIR/../lib/publish.sh"
@@ -1934,13 +1936,19 @@ write_digital_report() {
   local result="$1" outcome="$2" stage="$3"
   local report_dir="${XDG_STATE_HOME:-$HOME/.local/state}/music-ingest/reports"
   mkdir -p "$report_dir" || { echo "Warning: could not create report directory $report_dir"; return 0; }
-  python3 - "$result" "$report_dir" "$outcome" "$stage" "${SESSION_PUBLISHED_FILES:-0}" "${SESSION_CONFLICTS:-0}" "${DIGITAL_PUBLICATION_OUTCOMES:-}" <<'PYREPORT'
-import json, sys, time
+  python3 - "$result" "$report_dir" "$outcome" "$stage" "${SESSION_PUBLISHED_FILES:-0}" "${SESSION_CONFLICTS:-0}" "${DIGITAL_PUBLICATION_OUTCOMES:-}" "$SCRIPT_DIR/../lib" <<'PYREPORT'
+import json, os, sys, time
 from pathlib import Path
+sys.path.insert(0, sys.argv[8])
+from report_support import atomic_json_write, machine_instance_id
+
 source, directory, outcome, stage = sys.argv[1:5]
 data = json.loads(Path(source).read_text(encoding="utf-8"))
 data["outcome"] = outcome
-data["report_schema"] = "music-ingest-publication-v2"
+data["report_schema"] = "music-ingest-publication-v3"
+data["producer"] = "music-ingest"
+data["producer_version"] = os.environ.get("MUSIC_INGEST_VERSION") or "unknown"
+data["producer_instance_id"] = machine_instance_id()
 data["staging"] = stage or None
 data["source_lifecycle"] = "preserved"
 data["published_file_count"] = int(sys.argv[5])
@@ -2008,8 +2016,8 @@ for relative, action in sorted(outcomes.items()):
     items.append({"kind":"generated-auxiliary", "action":action if action in {"failed", "conflicting"} else "generated-auxiliary", "source_lifecycle":"not-applicable", "source":None, "destination":str(library_root / relative), "verification":"not-cleanup-evidence"})
 data["items"] = items
 data["reported_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-target = Path(directory) / f"music-ingest-{time.strftime('%Y%m%d-%H%M%S')}-{__import__('os').getpid()}.json"
-target.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+target = Path(directory) / f"music-ingest-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}-{time.time_ns()}.json"
+atomic_json_write(target, data)
 print(f"Report: {target}")
 PYREPORT
 }

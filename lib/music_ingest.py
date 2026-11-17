@@ -8,12 +8,14 @@ import os
 import shutil
 import subprocess
 import sys
-import tomllib
 import time
 from pathlib import Path
 
+import tomllib
+
 APP_DIR = Path(__file__).resolve().parents[1]
 WIZARD = APP_DIR / "bin" / "whipper-music-wizard"
+__version__ = (APP_DIR / "VERSION").read_text(encoding="utf-8").strip()
 CONFIG_PATH = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "music-ingest" / "config.toml"
 DEFAULTS = {
     "incoming": str(Path.home() / "Music" / "Incoming"),
@@ -220,6 +222,7 @@ def add_path_overrides(parser: argparse.ArgumentParser) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="music-ingest", description="Review, stage, and safely publish digital music or rip CDs.")
+    parser.add_argument("--version", action="version", version=f"music-ingest {__version__}")
     parser.add_argument("--config-file", type=Path, default=CONFIG_PATH, help="use a different TOML config")
     add_path_overrides(parser)
     parser.add_argument("--mode", choices=("dry-run", "apply"), help="digital import mode")
