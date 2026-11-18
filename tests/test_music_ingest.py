@@ -1,3 +1,7 @@
+import json
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -28,6 +32,104 @@ class MusicIngestConfigTests(unittest.TestCase):
                 atomic_json_write(target, {"complete": True})
             self.assertFalse(target.exists())
             self.assertEqual(list(Path(tmp).glob("*.partial")), [])
+
+    def test_digital_producer_report_is_accepted_by_cleanup_consumer(self):
+        repository = Path(__file__).resolve().parents[1]
+        cleanup_source = repository.parent / "ingest-cleanup" / "src"
+        if not cleanup_source.is_dir():
+            self.skipTest("sibling ingest-cleanup checkout is required for contract test")
+        sys.path.insert(0, str(cleanup_source))
+        try:
+            from ingest_cleanup.config import Category, Config
+            from ingest_cleanup.core import assess_category
+
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                source_root = root / "incoming"
+                library_root = root / "library"
+                stage = root / "stage"
+                state = root / "state" / "music-ingest"
+                relative = Path("Artist/Album/01 Track.flac")
+                source = source_root / "01 Track.flac"
+                destination = library_root / relative
+                staged = stage / relative
+                for directory in (
+                    source_root,
+                    destination.parent,
+                    staged.parent,
+                ):
+                    directory.mkdir(parents=True, exist_ok=True)
+                source.write_bytes(b"synthetic audio")
+                destination.write_bytes(source.read_bytes())
+                staged.write_bytes(source.read_bytes())
+                result = root / "planner-result.json"
+                result.write_text(
+                    json.dumps(
+                        {
+                            "mode": "apply",
+                            "approved_to_publish": True,
+                            "publication": "copy",
+                            "source_root": str(source_root),
+                            "library_root": str(library_root),
+                            "planned_tracks": 1,
+                            "copied_tracks": 1,
+                            "skipped_tracks": 0,
+                            "albums": [
+                                {
+                                    "tracks": [
+                                        {
+                                            "source": source.name,
+                                            "destination": str(relative),
+                                            "source_path": str(source),
+                                            "destination_path": str(destination),
+                                        }
+                                    ]
+                                }
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                outcomes = root / "outcomes.tsv"
+                outcomes.write_text(f"published\t{relative}\n", encoding="utf-8")
+                environment = {
+                    **os.environ,
+                    "HOME": str(root / "home"),
+                    "XDG_STATE_HOME": str(root / "state"),
+                    "MUSIC_INGEST_SOURCE_ONLY": "1",
+                    "SESSION_PUBLISHED_FILES": "1",
+                    "SESSION_CONFLICTS": "0",
+                    "DIGITAL_PUBLICATION_OUTCOMES": str(outcomes),
+                }
+                subprocess.run(
+                    [
+                        "bash",
+                        "-c",
+                        'source "$1"; write_digital_report "$2" '
+                        '"digital import published" "$3"',
+                        "contract-test",
+                        str(repository / "bin" / "whipper-music-wizard"),
+                        str(result),
+                        str(stage),
+                    ],
+                    check=True,
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                )
+                report = next((state / "reports").glob("*.json"))
+                payload = json.loads(report.read_text(encoding="utf-8"))
+                self.assertEqual(payload["report_schema"], "music-ingest-publication-v3")
+                self.assertTrue(payload["publication_completed"])
+
+                category = Category("Music", source_root, library_root, "music")
+                config = Config((category,), (), state, False)
+                assessed, rejected = assess_category(config, category)
+                self.assertEqual(rejected, [])
+                self.assertEqual(assessed[0].state, "SAFE")
+                self.assertEqual(assessed[0].destination, destination)
+        finally:
+            sys.path.remove(str(cleanup_source))
 
     def test_version_is_exposed(self):
         self.assertRegex(music_ingest.__version__, r"^\d+\.\d+\.\d+$")

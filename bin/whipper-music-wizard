@@ -2353,6 +2353,10 @@ main_menu() {
   fi
 }
 
+if [[ ${MUSIC_INGEST_SOURCE_ONLY:-} == 1 ]]; then
+  return 0 2>/dev/null || exit 0
+fi
+
 load_cfg
 if [[ -n "${MUSIC_INGEST_DEVICE:-}" ]]; then
   DEVICE="$MUSIC_INGEST_DEVICE"
